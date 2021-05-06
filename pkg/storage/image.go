@@ -14,6 +14,12 @@ import (
 	"github.com/containers/image/transports/alltransports"
 	"github.com/containers/image/types"
 	"github.com/containers/storage"
+	digest "github.com/opencontainers/go-digest"
+)
+
+var (
+	// ErrCannotParseImageID is returned when we try to ResolveNames for an image ID
+	ErrCannotParseImageID = errors.New("cannot parse an image ID")
 )
 
 // ImageResult wraps a subset of information about an image: its ID, its names,
@@ -22,6 +28,10 @@ type ImageResult struct {
 	ID    string
 	Names []string
 	Size  *uint64
+	// TODO(runcom): this is an hack for https://github.com/kubernetes-incubator/cri-o/pull/1136
+	// drop this when we have proper image IDs (as in, image IDs should be just
+	// the config blog digest which is stable across same images).
+	ConfigDigest digest.Digest
 }
 
 type indexInfo struct {
@@ -41,9 +51,12 @@ type imageService struct {
 // implementation.
 type ImageServer interface {
 	// ListImages returns list of all images which match the filter.
-	ListImages(filter string) ([]ImageResult, error)
+	ListImages(systemContext *types.SystemContext, filter string) ([]ImageResult, error)
 	// ImageStatus returns status of an image which matches the filter.
 	ImageStatus(systemContext *types.SystemContext, filter string) (*ImageResult, error)
+	// PrepareImage returns an Image where the config digest can be grabbed
+	// for further analysis. Call Close() on the resulting image.
+	PrepareImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.Image, error)
 	// PullImage imports an image from the specified location.
 	PullImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.ImageReference, error)
 	// RemoveImage deletes the specified image.
@@ -59,25 +72,40 @@ type ImageServer interface {
 	ResolveNames(imageName string) ([]string, error)
 }
 
-func (svc *imageService) ListImages(filter string) ([]ImageResult, error) {
+func (svc *imageService) getRef(name string) (types.ImageReference, error) {
+	ref, err := alltransports.ParseImageName(name)
+	if err != nil {
+		ref2, err2 := istorage.Transport.ParseStoreReference(svc.store, "@"+name)
+		if err2 != nil {
+			ref3, err3 := istorage.Transport.ParseStoreReference(svc.store, name)
+			if err3 != nil {
+				return nil, err
+			}
+			ref2 = ref3
+		}
+		ref = ref2
+	}
+	return ref, nil
+}
+
+func (svc *imageService) ListImages(systemContext *types.SystemContext, filter string) ([]ImageResult, error) {
 	results := []ImageResult{}
 	if filter != "" {
-		ref, err := alltransports.ParseImageName(filter)
+		ref, err := svc.getRef(filter)
 		if err != nil {
-			ref2, err2 := istorage.Transport.ParseStoreReference(svc.store, "@"+filter)
-			if err2 != nil {
-				ref3, err3 := istorage.Transport.ParseStoreReference(svc.store, filter)
-				if err3 != nil {
-					return nil, err
-				}
-				ref2 = ref3
-			}
-			ref = ref2
+			return nil, err
 		}
 		if image, err := istorage.Transport.GetStoreImage(svc.store, ref); err == nil {
+			img, err := ref.NewImage(systemContext)
+			if err != nil {
+				return nil, err
+			}
+			size := imageSize(img)
+			img.Close()
 			results = append(results, ImageResult{
 				ID:    image.ID,
 				Names: image.Names,
+				Size:  size,
 			})
 		}
 	} else {
@@ -86,9 +114,20 @@ func (svc *imageService) ListImages(filter string) ([]ImageResult, error) {
 			return nil, err
 		}
 		for _, image := range images {
+			ref, err := istorage.Transport.ParseStoreReference(svc.store, "@"+image.ID)
+			if err != nil {
+				return nil, err
+			}
+			img, err := ref.NewImage(systemContext)
+			if err != nil {
+				return nil, err
+			}
+			size := imageSize(img)
+			img.Close()
 			results = append(results, ImageResult{
 				ID:    image.ID,
 				Names: image.Names,
+				Size:  size,
 			})
 		}
 	}
@@ -117,14 +156,16 @@ func (svc *imageService) ImageStatus(systemContext *types.SystemContext, nameOrI
 	if err != nil {
 		return nil, err
 	}
+	defer img.Close()
 	size := imageSize(img)
-	img.Close()
 
-	return &ImageResult{
-		ID:    image.ID,
-		Names: image.Names,
-		Size:  size,
-	}, nil
+	res := &ImageResult{
+		ID:           image.ID,
+		Names:        image.Names,
+		Size:         size,
+		ConfigDigest: img.ConfigInfo().Digest,
+	}
+	return res, nil
 }
 
 func imageSize(img types.Image) *uint64 {
@@ -136,11 +177,11 @@ func imageSize(img types.Image) *uint64 {
 }
 
 func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool, error) {
-	srcRef, err := svc.prepareImage(imageName, options)
+	srcRef, err := svc.prepareReference(imageName, options)
 	if err != nil {
 		return false, err
 	}
-	rawSource, err := srcRef.NewImageSource(options.SourceCtx, nil)
+	rawSource, err := srcRef.NewImageSource(options.SourceCtx)
 	if err != nil {
 		return false, err
 	}
@@ -153,9 +194,9 @@ func (svc *imageService) CanPull(imageName string, options *copy.Options) (bool,
 	return true, nil
 }
 
-// prepareImage creates an image reference from an image string and set options
+// prepareReference creates an image reference from an image string and set options
 // for the source context
-func (svc *imageService) prepareImage(imageName string, options *copy.Options) (types.ImageReference, error) {
+func (svc *imageService) prepareReference(imageName string, options *copy.Options) (types.ImageReference, error) {
 	if imageName == "" {
 		return nil, storage.ErrNotAnImage
 	}
@@ -183,6 +224,18 @@ func (svc *imageService) prepareImage(imageName string, options *copy.Options) (
 	return srcRef, nil
 }
 
+func (svc *imageService) PrepareImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.Image, error) {
+	if options == nil {
+		options = &copy.Options{}
+	}
+
+	srcRef, err := svc.prepareReference(imageName, options)
+	if err != nil {
+		return nil, err
+	}
+	return srcRef.NewImage(systemContext)
+}
+
 func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName string, options *copy.Options) (types.ImageReference, error) {
 	policy, err := signature.DefaultPolicy(systemContext)
 	if err != nil {
@@ -196,7 +249,7 @@ func (svc *imageService) PullImage(systemContext *types.SystemContext, imageName
 		options = &copy.Options{}
 	}
 
-	srcRef, err := svc.prepareImage(imageName, options)
+	srcRef, err := svc.prepareReference(imageName, options)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +322,7 @@ func (svc *imageService) isSecureIndex(indexName string) bool {
 	for _, addr := range addrs {
 		for _, ipnet := range svc.insecureRegistryCIDRs {
 			// check if the addr falls in the subnet
-			if (*net.IPNet)(ipnet).Contains(addr) {
+			if ipnet.Contains(addr) {
 				return false
 			}
 		}
@@ -278,19 +331,27 @@ func (svc *imageService) isSecureIndex(indexName string) bool {
 	return true
 }
 
-func isValidHostname(hostname string) bool {
-	return hostname != "" && !strings.Contains(hostname, "/") &&
-		(strings.Contains(hostname, ".") ||
-			strings.Contains(hostname, ":") || hostname == "localhost")
+func splitDockerDomain(name string) (domain, remainder string) {
+	i := strings.IndexRune(name, '/')
+	if i == -1 || (!strings.ContainsAny(name[:i], ".:") && name[:i] != "localhost") {
+		domain, remainder = "", name
+	} else {
+		domain, remainder = name[:i], name[i+1:]
+	}
+	return
 }
 
 func (svc *imageService) ResolveNames(imageName string) ([]string, error) {
-	r, err := reference.ParseNormalizedNamed(imageName)
+	// This to prevent any image ID to go through this routine
+	_, err := reference.ParseNormalizedNamed(imageName)
 	if err != nil {
+		if strings.Contains(err.Error(), "cannot specify 64-byte hexadecimal strings") {
+			return nil, ErrCannotParseImageID
+		}
 		return nil, err
 	}
-	domain, rest := splitDomain(r.Name())
-	if len(domain) != 0 && isValidHostname(domain) {
+	domain, remainder := splitDockerDomain(imageName)
+	if domain != "" {
 		// this means the image is already fully qualified
 		return []string{imageName}, nil
 	}
@@ -304,12 +365,11 @@ func (svc *imageService) ResolveNames(imageName string) ([]string, error) {
 	// normalize the unqualified image to be domain/repo/image...
 	images := []string{}
 	for _, r := range svc.registries {
-		path := rest
-		if !isValidHostname(domain) {
-			// This is the case where we have an image like "runcom/busybox"
-			path = imageName
+		rem := remainder
+		if r == "docker.io" && !strings.ContainsRune(remainder, '/') {
+			rem = "library/" + rem
 		}
-		images = append(images, filepath.Join(r, path))
+		images = append(images, filepath.Join(r, rem))
 	}
 	return images, nil
 }

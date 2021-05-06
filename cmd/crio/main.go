@@ -1,27 +1,34 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/containers/storage/pkg/reexec"
 	"github.com/kubernetes-incubator/cri-o/libkpod"
 	"github.com/kubernetes-incubator/cri-o/server"
+	"github.com/kubernetes-incubator/cri-o/version"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
+	"github.com/soheilhy/cmux"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
-	"k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	"k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
-const crioConfigPath = "/etc/crio/crio.conf"
+// gitCommit is the commit that the binary is being built from.
+// It will be populated by the Makefile.
+var gitCommit = ""
 
 func validateConfig(config *server.Config) error {
 	switch config.ImageVolumes {
@@ -31,6 +38,11 @@ func validateConfig(config *server.Config) error {
 	default:
 		return fmt.Errorf("Unrecognized image volume type specified")
 
+	}
+
+	// This needs to match the read buffer size in conmon
+	if config.LogSizeMax >= 0 && config.LogSizeMax < 8192 {
+		return fmt.Errorf("log size max should be negative or >= 8192")
 	}
 	return nil
 }
@@ -46,7 +58,7 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 			// We don't error out if --config wasn't explicitly set and the
 			// default doesn't exist. But we will log a warning about it, so
 			// the user doesn't miss it.
-			logrus.Warnf("default configuration file does not exist: %s", crioConfigPath)
+			logrus.Warnf("default configuration file does not exist: %s", server.CrioConfigPath)
 		}
 	}
 
@@ -111,8 +123,17 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	if ctx.GlobalIsSet("cgroup-manager") {
 		config.CgroupManager = ctx.GlobalString("cgroup-manager")
 	}
+	if ctx.GlobalIsSet("hooks-dir-path") {
+		config.HooksDirPath = ctx.GlobalString("hooks-dir-path")
+	}
+	if ctx.GlobalIsSet("default-mounts") {
+		config.DefaultMounts = ctx.GlobalStringSlice("default-mounts")
+	}
 	if ctx.GlobalIsSet("pids-limit") {
 		config.PidsLimit = ctx.GlobalInt64("pids-limit")
+	}
+	if ctx.GlobalIsSet("log-size-max") {
+		config.LogSizeMax = ctx.GlobalInt64("log-size-max")
 	}
 	if ctx.GlobalIsSet("cni-config-dir") {
 		config.NetworkDir = ctx.GlobalString("cni-config-dir")
@@ -126,7 +147,7 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	return nil
 }
 
-func catchShutdown(gserver *grpc.Server, sserver *server.Server, signalled *bool) {
+func catchShutdown(gserver *grpc.Server, sserver *server.Server, hserver *http.Server, signalled *bool) {
 	sig := make(chan os.Signal, 10)
 	signal.Notify(sig, unix.SIGINT, unix.SIGTERM)
 	go func() {
@@ -141,6 +162,13 @@ func catchShutdown(gserver *grpc.Server, sserver *server.Server, signalled *bool
 			}
 			*signalled = true
 			gserver.GracefulStop()
+			hserver.Shutdown(context.Background())
+			// TODO(runcom): enable this after https://github.com/kubernetes/kubernetes/pull/51377
+			//sserver.StopStreamServer()
+			sserver.StopExitMonitor()
+			if err := sserver.Shutdown(); err != nil {
+				logrus.Warnf("error shutting down main service %v", err)
+			}
 			return
 		}
 	}()
@@ -151,9 +179,15 @@ func main() {
 		return
 	}
 	app := cli.NewApp()
+
+	var v []string
+	v = append(v, version.Version)
+	if gitCommit != "" {
+		v = append(v, fmt.Sprintf("commit: %s", gitCommit))
+	}
 	app.Name = "crio"
 	app.Usage = "crio server"
-	app.Version = "1.0.0-alpha.0"
+	app.Version = strings.Join(v, "\n")
 	app.Metadata = map[string]interface{}{
 		"config": server.DefaultConfig(),
 	}
@@ -161,16 +195,12 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "config",
-			Value: crioConfigPath,
+			Value: server.CrioConfigPath,
 			Usage: "path to configuration file",
 		},
 		cli.StringFlag{
 			Name:  "conmon",
 			Usage: "path to the conmon executable",
-		},
-		cli.BoolFlag{
-			Name:  "debug",
-			Usage: "enable debug output for logging",
 		},
 		cli.StringFlag{
 			Name:  "listen",
@@ -194,6 +224,11 @@ func main() {
 			Value: "text",
 			Usage: "set the format used by logs ('text' (default), or 'json')",
 		},
+		cli.StringFlag{
+			Name:  "log-level",
+			Usage: "log messages above specified level: debug, info (default), warn, error, fatal or panic",
+		},
+
 		cli.StringFlag{
 			Name:  "pause-command",
 			Usage: "name of the pause command in the pause image",
@@ -263,6 +298,11 @@ func main() {
 			Value: libkpod.DefaultPidsLimit,
 			Usage: "maximum number of processes allowed in a container",
 		},
+		cli.Int64Flag{
+			Name:  "log-size-max",
+			Value: libkpod.DefaultLogSizeMax,
+			Usage: "maximum log size in bytes for a container",
+		},
 		cli.StringFlag{
 			Name:  "cni-config-dir",
 			Usage: "CNI configuration files directory",
@@ -274,7 +314,18 @@ func main() {
 		cli.StringFlag{
 			Name:  "image-volumes",
 			Value: string(libkpod.ImageVolumesMkdir),
-			Usage: "image volume handling ('mkdir' or 'ignore')",
+			Usage: "image volume handling ('mkdir', 'bind', or 'ignore')",
+		},
+		cli.StringFlag{
+			Name:   "hooks-dir-path",
+			Usage:  "set the OCI hooks directory path",
+			Value:  libkpod.DefaultHooksDirPath,
+			Hidden: true,
+		},
+		cli.StringSliceFlag{
+			Name:   "default-mounts",
+			Usage:  "add one or more default mount paths in the form host:container",
+			Hidden: true,
 		},
 		cli.BoolFlag{
 			Name:  "profile",
@@ -321,8 +372,13 @@ func main() {
 
 		logrus.SetFormatter(cf)
 
-		if c.GlobalBool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
+		if loglevel := c.GlobalString("log-level"); loglevel != "" {
+			level, err := logrus.ParseLevel(loglevel)
+			if err != nil {
+				return err
+			}
+
+			logrus.SetLevel(level)
 		}
 
 		if path := c.GlobalString("log"); path != "" {
@@ -354,6 +410,16 @@ func main() {
 			}()
 		}
 
+		args := c.Args()
+		if len(args) > 0 {
+			for _, command := range app.Commands {
+				if args[0] == command.Name {
+					break
+				}
+			}
+			return fmt.Errorf("command %q not supported", args[0])
+		}
+
 		config := c.App.Metadata["config"].(*server.Config)
 
 		if !config.SELinux {
@@ -363,6 +429,10 @@ func main() {
 		if _, err := os.Stat(config.Runtime); os.IsNotExist(err) {
 			// path to runtime does not exist
 			return fmt.Errorf("invalid --runtime value %q", err)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(config.Listen), 0755); err != nil {
+			return err
 		}
 
 		// Remove the socket if it already exists
@@ -400,8 +470,6 @@ func main() {
 			}()
 		}
 
-		graceful := false
-		catchShutdown(s, service, &graceful)
 		runtime.RegisterRuntimeServiceServer(s, service)
 		runtime.RegisterImageServiceServer(s, service)
 
@@ -412,18 +480,54 @@ func main() {
 			service.StartExitMonitor()
 		}()
 
-		err = s.Serve(lis)
-		if graceful && strings.Contains(strings.ToLower(err.Error()), "use of closed network connection") {
-			err = nil
+		m := cmux.New(lis)
+		grpcL := m.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
+		httpL := m.Match(cmux.HTTP1Fast())
+
+		infoMux := service.GetInfoMux()
+		srv := &http.Server{
+			Handler:     infoMux,
+			ReadTimeout: 5 * time.Second,
 		}
 
-		if err2 := service.Shutdown(); err2 != nil {
-			logrus.Infof("error shutting down layer storage: %v", err2)
+		graceful := false
+		catchShutdown(s, service, srv, &graceful)
+
+		go s.Serve(grpcL)
+		go srv.Serve(httpL)
+
+		serverCloseCh := make(chan struct{})
+		go func() {
+			defer close(serverCloseCh)
+			if err := m.Serve(); err != nil {
+				if graceful && strings.Contains(strings.ToLower(err.Error()), "use of closed network connection") {
+					err = nil
+				} else {
+					logrus.Errorf("Failed to serve grpc grpc request: %v", err)
+				}
+			}
+		}()
+
+		// TODO(runcom): enable this after https://github.com/kubernetes/kubernetes/pull/51377
+		//streamServerCloseCh := service.StreamingServerCloseChan()
+		serverExitMonitorCh := service.ExitMonitorCloseChan()
+		select {
+		// TODO(runcom): enable this after https://github.com/kubernetes/kubernetes/pull/51377
+		//case <-streamServerCloseCh:
+		case <-serverExitMonitorCh:
+		case <-serverCloseCh:
 		}
 
-		if err != nil {
-			logrus.Fatal(err)
-		}
+		service.Shutdown()
+
+		// TODO(runcom): enable this after https://github.com/kubernetes/kubernetes/pull/51377
+		//<-streamServerCloseCh
+		//logrus.Debug("closed stream server")
+		<-serverExitMonitorCh
+		logrus.Debug("closed exit monitor")
+		<-serverCloseCh
+		logrus.Debug("closed main server")
+
 		return nil
 	}
 

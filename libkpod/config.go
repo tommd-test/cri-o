@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 
 	"github.com/BurntSushi/toml"
+	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/opencontainers/selinux/go-selinux"
 )
 
@@ -20,9 +21,9 @@ const (
 	apparmorProfileName = "crio-default"
 	cniConfigDir        = "/etc/cni/net.d/"
 	cniBinDir           = "/opt/cni/bin/"
-	cgroupManager       = "cgroupfs"
+	cgroupManager       = oci.CgroupfsCgroupsManager
 	lockPath            = "/run/crio.lock"
-	containerExitsDir   = "/var/run/kpod/exits"
+	containerExitsDir   = oci.ContainerExitsDir
 )
 
 // Config represents the entire set of configuration values that can be set for
@@ -50,6 +51,10 @@ const (
 	// DefaultPidsLimit is the default value for maximum number of processes
 	// allowed inside a container
 	DefaultPidsLimit = 1024
+
+	// DefaultLogSizeMax is the default value for the maximum log size
+	// allowed for a container. Negative values mean that no limit is imposed.
+	DefaultLogSizeMax = -1
 )
 
 // This structure is necessary to fake the TOML tables when parsing,
@@ -113,6 +118,9 @@ type RuntimeConfig struct {
 	// container runtime for all containers.
 	DefaultWorkloadTrust string `toml:"default_workload_trust"`
 
+	// NoPivot instructs the runtime to not use `pivot_root`, but instead use `MS_MOVE`
+	NoPivot bool `toml:"no_pivot"`
+
 	// Conmon is the path to conmon binary, used for managing the runtime.
 	Conmon string `toml:"conmon"`
 
@@ -134,9 +142,25 @@ type RuntimeConfig struct {
 	// handle cgroups for containers.
 	CgroupManager string `toml:"cgroup_manager"`
 
+	// HooksDirPath location of oci hooks config files
+	HooksDirPath string `toml:"hooks_dir_path"`
+
+	// DefaultMounts is the list of mounts to be mounted for each container
+	// The format of each mount is "host-path:container-path"
+	DefaultMounts []string `toml:"default_mounts"`
+
+	// Hooks List of hooks to run with container
+	Hooks map[string]HookParams
+
 	// PidsLimit is the number of processes each container is restricted to
 	// by the cgroup process number controller.
 	PidsLimit int64 `toml:"pids_limit"`
+
+	// LogSizeMax is the maximum number of bytes after which the log file
+	// will be truncated. It can be expressed as a human-friendly string
+	// that is parsed to bytes.
+	// Negative values indicate that the log file won't be truncated.
+	LogSizeMax int64 `toml:"log_size_max"`
 
 	// ContainerExitsDir is the directory in which container exit files are
 	// written to by conmon.
@@ -266,6 +290,8 @@ func DefaultConfig() *Config {
 			CgroupManager:     cgroupManager,
 			PidsLimit:         DefaultPidsLimit,
 			ContainerExitsDir: containerExitsDir,
+			HooksDirPath:      DefaultHooksDirPath,
+			LogSizeMax:        DefaultLogSizeMax,
 		},
 		ImageConfig: ImageConfig{
 			DefaultTransport:    defaultTransport,

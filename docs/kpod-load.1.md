@@ -8,18 +8,20 @@ kpod-load - Load an image from docker archive
 ## SYNOPSIS
 **kpod load**
 **NAME[:TAG|@DIGEST]**
+[**--input**|**-i**]
+[**--quiet**|**-q**]
 [**--help**|**-h**]
 
 ## DESCRIPTION
-**kpod load** copies an image from **docker-archive** stored on the local machine.
-**kpod load** reads from stdin by default or a file if the **input** flag is set.
+**kpod load** copies an image from either **docker-archive** or **oci-archive** stored
+on the local machine. **kpod load** reads from stdin by default or a file if the **input** flag is set.
 The **quiet** flag suppresses the output when set.
 
 **kpod [GLOBAL OPTIONS]**
 
 **kpod load [GLOBAL OPTIONS]**
 
-**kpod load [OPTIONS] NAME[:TAG|@DIGEST] [GLOBAL OPTIONS]**
+**kpod load [OPTIONS] NAME[:TAG|@DIGEST]**
 
 ## OPTIONS
 
@@ -28,11 +30,6 @@ Read from archive file, default is STDIN
 
 **--quiet, -q**
 Suppress the output
-
-## GLOBAL OPTIONS
-
-**--help, -h**
-  Print usage statement
 
 ## EXAMPLES
 

@@ -19,10 +19,11 @@ import (
 	"github.com/kubernetes-incubator/cri-o/pkg/storage"
 	"github.com/opencontainers/runc/libcontainer"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 // ContainerServer implements the ImageServer
@@ -36,6 +37,7 @@ type ContainerServer struct {
 	ctrIDIndex           *truncindex.TruncIndex
 	podNameIndex         *registrar.Registrar
 	podIDIndex           *truncindex.TruncIndex
+	hooks                map[string]HookParams
 
 	imageContext *types.SystemContext
 	stateLock    sync.Locker
@@ -46,6 +48,11 @@ type ContainerServer struct {
 // Runtime returns the oci runtime for the ContainerServer
 func (c *ContainerServer) Runtime() *oci.Runtime {
 	return c.runtime
+}
+
+// Hooks returns the oci hooks for the ContainerServer
+func (c *ContainerServer) Hooks() map[string]HookParams {
+	return c.hooks
 }
 
 // Store returns the Store for the ContainerServer
@@ -115,7 +122,7 @@ func New(config *Config) (*ContainerServer, error) {
 		return nil, err
 	}
 
-	runtime, err := oci.New(config.Runtime, config.RuntimeUntrustedWorkload, config.DefaultWorkloadTrust, config.Conmon, config.ConmonEnv, config.CgroupManager, config.ContainerExitsDir)
+	runtime, err := oci.New(config.Runtime, config.RuntimeUntrustedWorkload, config.DefaultWorkloadTrust, config.Conmon, config.ConmonEnv, config.CgroupManager, config.ContainerExitsDir, config.LogSizeMax, config.NoPivot)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +138,21 @@ func New(config *Config) (*ContainerServer, error) {
 		lock = new(sync.Mutex)
 	}
 
+	hooks := make(map[string]HookParams)
+	// If hooks directory is set in config use it
+	if config.HooksDirPath != "" {
+		if err := readHooks(config.HooksDirPath, hooks); err != nil {
+			return nil, err
+		}
+		// If user overrode default hooks, this means it is in a test, so don't
+		// use OverrideHooksDirPath
+		if config.HooksDirPath == DefaultHooksDirPath {
+			if err := readHooks(OverrideHooksDirPath, hooks); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return &ContainerServer{
 		runtime:              runtime,
 		store:                store,
@@ -141,10 +163,13 @@ func New(config *Config) (*ContainerServer, error) {
 		podNameIndex:         registrar.NewRegistrar(),
 		podIDIndex:           truncindex.NewTruncIndex([]string{}),
 		imageContext:         &types.SystemContext{SignaturePolicyPath: config.SignaturePolicyPath},
+		hooks:                hooks,
 		stateLock:            lock,
 		state: &containerServerState{
-			containers: oci.NewMemoryStore(),
-			sandboxes:  make(map[string]*sandbox.Sandbox),
+			containers:      oci.NewMemoryStore(),
+			infraContainers: oci.NewMemoryStore(),
+			sandboxes:       sandbox.NewMemoryStore(),
+			processLevels:   make(map[string]int),
 		},
 		config: config,
 	}, nil
@@ -293,6 +318,8 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 		return err
 	}
 
+	ip := m.Annotations[annotations.IP]
+
 	processLabel, mountLabel, err := label.InitLabels(label.DupSecOpt(m.Process.SelinuxLabel))
 	if err != nil {
 		return err
@@ -310,6 +337,8 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 	if err != nil {
 		return err
 	}
+	sb.AddHostnamePath(m.Annotations[annotations.HostnamePath])
+	sb.AddIP(ip)
 
 	// We add a netNS only if we can load a permanent one.
 	// Otherwise, the sandbox will live in the host namespace.
@@ -357,10 +386,12 @@ func (c *ContainerServer) LoadSandbox(id string) error {
 		return err
 	}
 
-	scontainer, err := oci.NewContainer(m.Annotations[annotations.ContainerID], cname, sandboxPath, m.Annotations[annotations.LogPath], sb.NetNs(), labels, kubeAnnotations, "", "", "", nil, id, false, false, false, privileged, trusted, sandboxDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
+	scontainer, err := oci.NewContainer(m.Annotations[annotations.ContainerID], cname, sandboxPath, m.Annotations[annotations.LogPath], sb.NetNs(), labels, m.Annotations, kubeAnnotations, "", "", "", nil, id, false, false, false, privileged, trusted, sandboxDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
 	if err != nil {
 		return err
 	}
+	scontainer.SetSpec(&m)
+	scontainer.SetMountPoint(m.Annotations[annotations.MountPoint])
 
 	if m.Annotations[annotations.Volumes] != "" {
 		containerVolumes := []oci.ContainerVolume{}
@@ -479,10 +510,12 @@ func (c *ContainerServer) LoadContainer(id string) error {
 		return err
 	}
 
-	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations[annotations.LogPath], sb.NetNs(), labels, kubeAnnotations, img, imgName, imgRef, &metadata, sb.ID(), tty, stdin, stdinOnce, sb.Privileged(), sb.Trusted(), containerDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
+	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations[annotations.LogPath], sb.NetNs(), labels, m.Annotations, kubeAnnotations, img, imgName, imgRef, &metadata, sb.ID(), tty, stdin, stdinOnce, sb.Privileged(), sb.Trusted(), containerDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
 	if err != nil {
 		return err
 	}
+	ctr.SetSpec(&m)
+	ctr.SetMountPoint(m.Annotations[annotations.MountPoint])
 
 	c.ContainerStateFromDisk(ctr)
 
@@ -577,48 +610,55 @@ func (c *ContainerServer) Shutdown() error {
 }
 
 type containerServerState struct {
-	containers oci.ContainerStorer
-	sandboxes  map[string]*sandbox.Sandbox
+	containers      oci.ContainerStorer
+	infraContainers oci.ContainerStorer
+	sandboxes       sandbox.Storer
+	// processLevels The number of sandboxes using the same SELinux MCS level. Need to release MCS Level, when count reaches 0
+	processLevels map[string]int
 }
 
 // AddContainer adds a container to the container state store
 func (c *ContainerServer) AddContainer(ctr *oci.Container) {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	sandbox := c.state.sandboxes[ctr.Sandbox()]
+	sandbox := c.state.sandboxes.Get(ctr.Sandbox())
 	sandbox.AddContainer(ctr)
 	c.state.containers.Add(ctr.ID(), ctr)
 }
 
+// AddInfraContainer adds a container to the container state store
+func (c *ContainerServer) AddInfraContainer(ctr *oci.Container) {
+	c.state.infraContainers.Add(ctr.ID(), ctr)
+}
+
 // GetContainer returns a container by its ID
 func (c *ContainerServer) GetContainer(id string) *oci.Container {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
 	return c.state.containers.Get(id)
+}
+
+// GetInfraContainer returns a container by its ID
+func (c *ContainerServer) GetInfraContainer(id string) *oci.Container {
+	return c.state.infraContainers.Get(id)
 }
 
 // HasContainer checks if a container exists in the state
 func (c *ContainerServer) HasContainer(id string) bool {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	ctr := c.state.containers.Get(id)
-	return ctr != nil
+	return c.state.containers.Get(id) != nil
 }
 
 // RemoveContainer removes a container from the container state store
 func (c *ContainerServer) RemoveContainer(ctr *oci.Container) {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
 	sbID := ctr.Sandbox()
-	sb := c.state.sandboxes[sbID]
+	sb := c.state.sandboxes.Get(sbID)
 	sb.RemoveContainer(ctr)
 	c.state.containers.Delete(ctr.ID())
 }
 
+// RemoveInfraContainer removes a container from the container state store
+func (c *ContainerServer) RemoveInfraContainer(ctr *oci.Container) {
+	c.state.infraContainers.Delete(ctr.ID())
+}
+
 // listContainers returns a list of all containers stored by the server state
 func (c *ContainerServer) listContainers() []*oci.Container {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
 	return c.state.containers.List()
 }
 
@@ -642,54 +682,52 @@ func (c *ContainerServer) ListContainers(filters ...func(*oci.Container) bool) (
 
 // AddSandbox adds a sandbox to the sandbox state store
 func (c *ContainerServer) AddSandbox(sb *sandbox.Sandbox) {
+	c.state.sandboxes.Add(sb.ID(), sb)
+
 	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	c.state.sandboxes[sb.ID()] = sb
+	c.state.processLevels[selinux.NewContext(sb.ProcessLabel())["level"]]++
+	c.stateLock.Unlock()
 }
 
 // GetSandbox returns a sandbox by its ID
 func (c *ContainerServer) GetSandbox(id string) *sandbox.Sandbox {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	return c.state.sandboxes[id]
+	return c.state.sandboxes.Get(id)
 }
 
 // GetSandboxContainer returns a sandbox's infra container
 func (c *ContainerServer) GetSandboxContainer(id string) *oci.Container {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	sb, ok := c.state.sandboxes[id]
-	if !ok {
-		return nil
-	}
+	sb := c.state.sandboxes.Get(id)
 	return sb.InfraContainer()
 }
 
 // HasSandbox checks if a sandbox exists in the state
 func (c *ContainerServer) HasSandbox(id string) bool {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	_, ok := c.state.sandboxes[id]
-	return ok
+	return c.state.sandboxes.Get(id) != nil
 }
 
 // RemoveSandbox removes a sandbox from the state store
 func (c *ContainerServer) RemoveSandbox(id string) {
+	sb := c.state.sandboxes.Get(id)
+	processLabel := sb.ProcessLabel()
+	level := selinux.NewContext(processLabel)["level"]
+
 	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	delete(c.state.sandboxes, id)
+	pl, ok := c.state.processLevels[level]
+	if ok {
+		c.state.processLevels[level] = pl - 1
+		if c.state.processLevels[level] == 0 {
+			label.ReleaseLabel(processLabel)
+			delete(c.state.processLevels, level)
+		}
+	}
+	c.stateLock.Unlock()
+
+	c.state.sandboxes.Delete(id)
 }
 
 // ListSandboxes lists all sandboxes in the state store
 func (c *ContainerServer) ListSandboxes() []*sandbox.Sandbox {
-	c.stateLock.Lock()
-	defer c.stateLock.Unlock()
-	sbArray := make([]*sandbox.Sandbox, 0, len(c.state.sandboxes))
-	for _, sb := range c.state.sandboxes {
-		sbArray = append(sbArray, sb)
-	}
-
-	return sbArray
+	return c.state.sandboxes.List()
 }
 
 // LibcontainerStats gets the stats for the container with the given id from runc/libcontainer

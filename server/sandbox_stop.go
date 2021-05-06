@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"os"
+	"time"
 
 	"github.com/containers/storage"
 	"github.com/docker/docker/pkg/mount"
@@ -14,13 +14,18 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
-	"k8s.io/kubernetes/pkg/kubelet/network/hostport"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 // StopPodSandbox stops the sandbox. If there are any running containers in the
 // sandbox, they should be force terminated.
-func (s *Server) StopPodSandbox(ctx context.Context, req *pb.StopPodSandboxRequest) (*pb.StopPodSandboxResponse, error) {
+func (s *Server) StopPodSandbox(ctx context.Context, req *pb.StopPodSandboxRequest) (resp *pb.StopPodSandboxResponse, err error) {
+	const operation = "stop_pod_sandbox"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
+
 	logrus.Debugf("StopPodSandboxRequest %+v", req)
 	sb, err := s.getPodSandboxFromRequest(req.PodSandboxId)
 	if err != nil {
@@ -32,54 +37,33 @@ func (s *Server) StopPodSandbox(ctx context.Context, req *pb.StopPodSandboxReque
 		// the the CRI interface which expects to not error out in not found
 		// cases.
 
-		resp := &pb.StopPodSandboxResponse{}
+		resp = &pb.StopPodSandboxResponse{}
 		logrus.Warnf("could not get sandbox %s, it's probably been stopped already: %v", req.PodSandboxId, err)
 		logrus.Debugf("StopPodSandboxResponse %s: %+v", req.PodSandboxId, resp)
 		return resp, nil
 	}
 
 	if sb.Stopped() {
-		resp := &pb.StopPodSandboxResponse{}
+		resp = &pb.StopPodSandboxResponse{}
 		logrus.Debugf("StopPodSandboxResponse %s: %+v", sb.ID(), resp)
 		return resp, nil
 	}
 
-	podInfraContainer := sb.InfraContainer()
-	netnsPath, err := podInfraContainer.NetNsPath()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := os.Stat(netnsPath); err == nil {
-		if err2 := s.hostportManager.Remove(sb.ID(), &hostport.PodPortMapping{
-			Name:         sb.Name(),
-			PortMappings: sb.PortMappings(),
-			HostNetwork:  false,
-		}); err2 != nil {
-			logrus.Warnf("failed to remove hostport for container %s in sandbox %s: %v",
-				podInfraContainer.Name(), sb.ID(), err2)
-		}
-
-		if err2 := s.netPlugin.TearDownPod(netnsPath, sb.Namespace(), sb.KubeName(), sb.ID()); err2 != nil {
-			logrus.Warnf("failed to destroy network for container %s in sandbox %s: %v",
-				podInfraContainer.Name(), sb.ID(), err2)
-		}
-	} else if !os.IsNotExist(err) { // it's ok for netnsPath to *not* exist
-		return nil, fmt.Errorf("failed to stat netns path for container %s in sandbox %s before tearing down the network: %v",
-			sb.Name(), sb.ID(), err)
-	}
-
-	// Close the sandbox networking namespace.
+	// Clean up sandbox networking and close its network namespace.
+	hostNetwork := sb.NetNsPath() == ""
+	s.networkStop(hostNetwork, sb)
 	if err := sb.NetNsRemove(); err != nil {
 		return nil, err
 	}
 
+	podInfraContainer := sb.InfraContainer()
 	containers := sb.Containers().List()
 	containers = append(containers, podInfraContainer)
 
 	for _, c := range containers {
 		cStatus := s.Runtime().ContainerStatus(c)
 		if cStatus.Status != oci.ContainerStateStopped {
-			if err := s.Runtime().StopContainer(c, -1); err != nil {
+			if err := s.Runtime().StopContainer(ctx, c, 10); err != nil {
 				return nil, fmt.Errorf("failed to stop container %s in pod sandbox %s: %v", c.Name(), sb.ID(), err)
 			}
 			if c.ID() == podInfraContainer.ID() {
@@ -118,7 +102,7 @@ func (s *Server) StopPodSandbox(ctx context.Context, req *pb.StopPodSandboxReque
 	}
 
 	sb.SetStopped()
-	resp := &pb.StopPodSandboxResponse{}
+	resp = &pb.StopPodSandboxResponse{}
 	logrus.Debugf("StopPodSandboxResponse %s: %+v", sb.ID(), resp)
 	return resp, nil
 }

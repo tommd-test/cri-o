@@ -19,6 +19,9 @@ const (
 	// HostName is the container host name annotation
 	HostName = "io.kubernetes.cri-o.HostName"
 
+	// IP is the container ipv4 or ipv6 address
+	IP = "io.kubernetes.cri-o.IP"
+
 	// Image is the container image ID annotation
 	Image = "io.kubernetes.cri-o.Image"
 
@@ -49,6 +52,9 @@ const (
 	// ResolvPath is the resolver configuration path annotation
 	ResolvPath = "io.kubernetes.cri-o.ResolvPath"
 
+	// HostnamePath is the path to /etc/hostname to bind mount annotation
+	HostnamePath = "io.kubernetes.cri-o.HostnamePath"
+
 	// SandboxID is the sandbox ID annotation
 	SandboxID = "io.kubernetes.cri-o.SandboxID"
 
@@ -57,6 +63,9 @@ const (
 
 	// ShmPath is the shared memory path annotation
 	ShmPath = "io.kubernetes.cri-o.ShmPath"
+
+	// MountPoint is the mount point of the container rootfs
+	MountPoint = "io.kubernetes.cri-o.MountPoint"
 
 	// TrustedSandbox is the annotation for trusted sandboxes
 	TrustedSandbox = "io.kubernetes.cri-o.TrustedSandbox"

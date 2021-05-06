@@ -2,21 +2,13 @@ package main
 
 import (
 	"io"
+	"io/ioutil"
 	"os"
 
-	"io/ioutil"
-
-	"github.com/containers/storage"
-	"github.com/kubernetes-incubator/cri-o/libkpod/common"
-	libkpodimage "github.com/kubernetes-incubator/cri-o/libkpod/image"
+	"github.com/kubernetes-incubator/cri-o/libpod"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 )
-
-type loadOptions struct {
-	input string
-	quiet bool
-}
 
 var (
 	loadFlags = []cli.Flag{
@@ -44,22 +36,26 @@ var (
 // loadCmd gets the image/file to be loaded from the command line
 // and calls loadImage to load the image to containers-storage
 func loadCmd(c *cli.Context) error {
-	config, err := getConfig(c)
-	if err != nil {
-		return errors.Wrapf(err, "could not get config")
+
+	args := c.Args()
+	var image string
+	if len(args) == 1 {
+		image = args[0]
 	}
-	store, err := getStore(config)
-	if err != nil {
+	if len(args) > 1 {
+		return errors.New("too many arguments. Requires exactly 1")
+	}
+	if err := validateFlags(c, loadFlags); err != nil {
 		return err
 	}
 
-	args := c.Args()
-	if len(args) > 0 {
-		return errors.New("too many arguments. Requires exactly 1")
+	runtime, err := getRuntime(c)
+	if err != nil {
+		return errors.Wrapf(err, "could not get runtime")
 	}
+	defer runtime.Shutdown(false)
 
 	input := c.String("input")
-	quiet := c.Bool("quiet")
 
 	if input == "/dev/stdin" {
 		fi, err := os.Stdin.Stat()
@@ -90,20 +86,22 @@ func loadCmd(c *cli.Context) error {
 		}
 	}
 
-	opts := loadOptions{
-		input: input,
-		quiet: quiet,
+	var output io.Writer
+	if !c.Bool("quiet") {
+		output = os.Stdout
 	}
 
-	return loadImage(store, opts)
-}
+	src := libpod.DockerArchive + ":" + input
+	if err := runtime.PullImage(src, false, "", output); err != nil {
+		src = libpod.OCIArchive + ":" + input
+		// generate full src name with specified image:tag
+		if image != "" {
+			src = src + ":" + image
+		}
+		if err := runtime.PullImage(src, false, "", output); err != nil {
+			return errors.Wrapf(err, "error pulling %q", src)
+		}
+	}
 
-// loadImage loads the image from docker-archive or oci to containers-storage
-// using the pullImage function
-func loadImage(store storage.Store, opts loadOptions) error {
-	systemContext := common.GetSystemContext("")
-
-	src := dockerArchive + opts.input
-
-	return libkpodimage.PullImage(store, src, false, opts.quiet, systemContext)
+	return nil
 }

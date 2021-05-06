@@ -5,12 +5,12 @@ import (
 	"strings"
 
 	"github.com/docker/docker/pkg/stringid"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 const (
 	kubePrefix    = "k8s"
-	infraName     = "infra"
+	infraName     = "POD"
 	nameDelimiter = "_"
 )
 

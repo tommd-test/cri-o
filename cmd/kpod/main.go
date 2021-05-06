@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/containers/storage/pkg/reexec"
@@ -8,10 +9,13 @@ import (
 	"github.com/urfave/cli"
 )
 
-//Version of kpod
-const Version string = "0.0.1"
+// This is populated by the Makefile from the VERSION file
+// in the repository
+var kpodVersion = ""
 
 func main() {
+	debug := false
+
 	if reexec.Init() {
 		return
 	}
@@ -19,7 +23,12 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "kpod"
 	app.Usage = "manage pods and images"
-	app.Version = Version
+
+	var v string
+	if kpodVersion != "" {
+		v = kpodVersion
+	}
+	app.Version = v
 
 	app.Commands = []cli.Command{
 		diffCommand,
@@ -28,26 +37,44 @@ func main() {
 		imagesCommand,
 		infoCommand,
 		inspectCommand,
+		killCommand,
 		loadCommand,
+		loginCommand,
+		logoutCommand,
 		logsCommand,
 		mountCommand,
+		pauseCommand,
+		psCommand,
 		pullCommand,
 		pushCommand,
 		renameCommand,
+		rmCommand,
 		rmiCommand,
 		saveCommand,
+		statsCommand,
+		stopCommand,
 		tagCommand,
 		umountCommand,
+		unpauseCommand,
 		versionCommand,
-		saveCommand,
-		statsCommand,
-		loadCommand,
+		waitCommand,
 	}
 	app.Before = func(c *cli.Context) error {
-		logrus.SetLevel(logrus.ErrorLevel)
-		if c.GlobalBool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
+		logLevel := c.GlobalString("log-level")
+		if logLevel != "" {
+			level, err := logrus.ParseLevel(logLevel)
+			if err != nil {
+				return err
+			}
+
+			logrus.SetLevel(level)
 		}
+
+		if logLevel == "debug" {
+			debug = true
+
+		}
+
 		return nil
 	}
 	app.After = func(*cli.Context) error {
@@ -65,9 +92,10 @@ func main() {
 			Name:  "config, c",
 			Usage: "path of a config file detailing container server configuration options",
 		},
-		cli.BoolFlag{
-			Name:  "debug",
-			Usage: "print debugging information",
+		cli.StringFlag{
+			Name:  "log-level",
+			Usage: "log messages above specified level: debug, info, warn, error (default), fatal or panic",
+			Value: "error",
 		},
 		cli.StringFlag{
 			Name:  "root",
@@ -83,7 +111,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "storage-driver, s",
-			Usage: "select which storage driver is used to manage storage of images and containers (default is overlay2)",
+			Usage: "select which storage driver is used to manage storage of images and containers (default is overlay)",
 		},
 		cli.StringSliceFlag{
 			Name:  "storage-opt",
@@ -91,7 +119,11 @@ func main() {
 		},
 	}
 	if err := app.Run(os.Args); err != nil {
-		logrus.Errorf(err.Error())
+		if debug {
+			logrus.Errorf(err.Error())
+		} else {
+			fmt.Fprintln(os.Stderr, err.Error())
+		}
 		cli.OsExiter(1)
 	}
 }

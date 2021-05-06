@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/containers/image/types"
 	"github.com/containers/storage/pkg/archive"
-	"github.com/kubernetes-incubator/cri-o/libkpod/common"
-	libkpodimage "github.com/kubernetes-incubator/cri-o/libkpod/image"
+	"github.com/kubernetes-incubator/cri-o/libpod"
+	"github.com/kubernetes-incubator/cri-o/libpod/common"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh/terminal"
@@ -15,11 +16,6 @@ import (
 
 var (
 	pushFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:   "disable-compression, D",
-			Usage:  "don't compress layers",
-			Hidden: true,
-		},
 		cli.StringFlag{
 			Name:   "signature-policy",
 			Usage:  "`pathname` of signature policy file (not usually used)",
@@ -72,14 +68,12 @@ func pushCmd(c *cli.Context) error {
 	if len(args) < 2 {
 		return errors.New("kpod push requires exactly 2 arguments")
 	}
+	if err := validateFlags(c, pushFlags); err != nil {
+		return err
+	}
 	srcName := c.Args().Get(0)
 	destName := c.Args().Get(1)
 
-	signaturePolicy := c.String("signature-policy")
-	compress := archive.Uncompressed
-	if !c.Bool("disable-compression") {
-		compress = archive.Gzip
-	}
 	registryCredsString := c.String("creds")
 	certPath := c.String("cert-dir")
 	skipVerify := !c.BoolT("tls-verify")
@@ -103,19 +97,20 @@ func pushCmd(c *cli.Context) error {
 		registryCreds = creds
 	}
 
-	config, err := getConfig(c)
+	runtime, err := getRuntime(c)
 	if err != nil {
-		return errors.Wrapf(err, "Could not get config")
+		return errors.Wrapf(err, "could not create runtime")
 	}
-	store, err := getStore(config)
-	if err != nil {
-		return err
+	defer runtime.Shutdown(false)
+
+	var writer io.Writer
+	if !c.Bool("quiet") {
+		writer = os.Stdout
 	}
 
-	options := libkpodimage.CopyOptions{
-		Compression:         compress,
-		SignaturePolicyPath: signaturePolicy,
-		Store:               store,
+	options := libpod.CopyOptions{
+		Compression:         archive.Uncompressed,
+		SignaturePolicyPath: c.String("signature-policy"),
 		DockerRegistryOptions: common.DockerRegistryOptions{
 			DockerRegistryCreds:         registryCreds,
 			DockerCertPath:              certPath,
@@ -126,8 +121,6 @@ func pushCmd(c *cli.Context) error {
 			SignBy:           signBy,
 		},
 	}
-	if !c.Bool("quiet") {
-		options.ReportWriter = os.Stderr
-	}
-	return libkpodimage.PushImage(srcName, destName, options)
+
+	return runtime.PushImage(srcName, destName, options, writer)
 }

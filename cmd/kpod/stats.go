@@ -8,9 +8,10 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/docker/go-units"
+
 	tm "github.com/buger/goterm"
 	"github.com/kubernetes-incubator/cri-o/libkpod"
-	libkpodimage "github.com/kubernetes-incubator/cri-o/libkpod/image"
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
@@ -62,6 +63,9 @@ var (
 )
 
 func statsCmd(c *cli.Context) error {
+	if err := validateFlags(c, statsFlags); err != nil {
+		return err
+	}
 	config, err := getConfig(c)
 	if err != nil {
 		return errors.Wrapf(err, "could not read config")
@@ -179,7 +183,7 @@ func outputStatsUsingFormatString(stats *libkpod.ContainerStats) {
 }
 
 func combineHumanValues(a, b uint64) string {
-	return fmt.Sprintf("%s / %s", libkpodimage.FormattedSize(float64(a)), libkpodimage.FormattedSize(float64(b)))
+	return fmt.Sprintf("%s / %s", units.HumanSize(float64(a)), units.HumanSize(float64(b)))
 }
 
 func floatToPercentString(f float64) string {

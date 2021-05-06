@@ -137,6 +137,15 @@ _kpod_inspect() {
             ;;
     esac
 }
+_kpod_kill() {
+     local options_with_args="
+     --signal -s
+     "
+     local boolean_options="
+     --help
+     -h"
+     _complete_ "$options_with_args" "$boolean_options"
+}
 
 _kpod_logs() {
      local options_with_args="
@@ -255,6 +264,27 @@ _kpod_rename() {
     esac
 }
 
+_kpod_rm() {
+    local boolean_options="
+    --force
+    -f
+    "
+
+    local options_with_args="
+    "
+
+    local all_options="$options_with_args $boolean_options"
+
+    case "$cur" in
+        -*)
+            COMPREPLY=($(compgen -W "$boolean_options $options_with_args" -- "$cur"))
+            ;;
+        *)
+            __kpod_list_containers
+            ;;
+    esac
+}
+
 _kpod_rmi() {
     local boolean_options="
      --help
@@ -311,6 +341,7 @@ _kpod_version() {
 _kpod_save() {
      local options_with_args="
      --output -o
+     --format
      "
      local boolean_options="
      --quiet -q
@@ -324,6 +355,52 @@ _kpod_export() {
      "
      local boolean_options="
      "
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
+_kpod_pause() {
+     local options_with_args="
+     --help -h
+     "
+     local boolean_options=""
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
+_kpod_ps() {
+     local options_with_args="
+     --filter -f
+     --format
+     --last -n
+     "
+     local boolean_options="
+     --all -a
+     --latest -l
+     --no-trunc
+     --quiet -q
+     --size -s
+     --namespace --ns
+     "
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
+_kpod_stop() {
+     local options_with_args="
+     --timeout -t
+     "
+     local boolean_options=""
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
+_kpod_unpause() {
+     local options_with_args="
+     --help -h
+     "
+     local boolean_options=""
+     _complete_ "$options_with_args" "$boolean_options"
+
+_kpod_wait() {
+     local options_with_args=""
+     local boolean_options="--help -h"
      _complete_ "$options_with_args" "$boolean_options"
 }
 
@@ -354,6 +431,34 @@ _kpod_load() {
     _complete_ "$options_with_args" "$boolean_options"
 }
 
+_kpod_login() {
+     local options_with_args="
+     --username
+     -u
+     --password
+     -p
+     --authfile
+     "
+     local boolean_options="
+     --help
+     -h
+     "
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
+_kpod_logout() {
+     local options_with_args="
+     --authfile
+     "
+     local boolean_options="
+     --all
+     -a
+     --help
+     -h
+     "
+     _complete_ "$options_with_args" "$boolean_options"
+}
+
 _kpod_kpod() {
      local options_with_args="
            --config -c
@@ -361,9 +466,9 @@ _kpod_kpod() {
            --runroot
            --storage-driver
            --storage-opt
+           --log-level
     "
      local boolean_options="
-           --debug
            --help -h
            --version -v
      "
@@ -374,19 +479,28 @@ _kpod_kpod() {
     images
     info
     inspect
+    kill
     load
+    login
+    logout
     logs
     mount
+    pause
+    ps
     pull
     push
     rename
+    rm
     rmi
     save
     stats
+    stop
     tag
     umount
     unmount
+    unpause
     version
+    wait
      "
 
      case "$prev" in

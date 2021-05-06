@@ -13,13 +13,13 @@ crio - OCI Kubernetes Container Runtime daemon
 [**--config**=[*value*]]
 [**--conmon**=[*value*]]
 [**--cpu-profile**=[*value*]]
-[**--debug**]
 [**--default-transport**=[*value*]]
 [**--help**|**-h**]
 [**--insecure-registry**=[*value*]]
 [**--listen**=[*value*]]
 [**--log**=[*value*]]
 [**--log-format value**]
+[**--log-level value**]
 [**--pause-command**=[*value*]]
 [**--pause-image**=[*value*]]
 [**--registry**=[*value*]]
@@ -66,9 +66,6 @@ crio is meant to provide an integration path between OCI conformant runtimes and
 **--cpu-profile**=""
 set the CPU profile file path
 
-**--debug**
-  Enable debug output for logging
-
 **--default-transport**
   A prefix to prepend to image names that can't be pulled as-is.
 
@@ -90,7 +87,11 @@ set the CPU profile file path
   using --insecure-registry.
 
 **--image-volumes**=""
-  Image volume handling ('mkdir' or 'ignore') (default: "mkdir")
+  Image volume handling ('mkdir', 'bind' or 'ignore') (default: "mkdir")
+  mkdir: A directory is created inside the container root filesystem for the volumes.
+  bind: A directory is created inside container state directory and bind mounted into
+  the container for the volumes.
+  ignore: All volumes are just ignored and no action is taken.
 
 **--listen**=""
   Path to crio socket (default: "/var/run/crio.sock")
@@ -100,6 +101,13 @@ set the CPU profile file path
 
 **--log-format**=""
   Set the format used by logs ('text' (default), or 'json') (default: "text")
+
+**--log-level**=""
+  log CRI-O messages above specified level: debug, info (default), warn, error, fatal or panic
+
+**--log-size-max**=""
+  Maximum log size in bytes for a container (default: -1 (no limit)).
+  If it is positive, it must be >= 8192 (to match/exceed conmon read buffer).
 
 **--pause-command**=""
   Path to the pause executable in the pause image (default: "/pause")

@@ -46,7 +46,10 @@ func logsCmd(c *cli.Context) error {
 	if len(args) != 1 {
 		return errors.Errorf("'kpod logs' requires exactly one container name/ID")
 	}
-	container := args[0]
+	if err := validateFlags(c, logsFlags); err != nil {
+		return err
+	}
+	container := c.Args().First()
 	var opts libkpod.LogOptions
 	opts.Details = c.Bool("details")
 	opts.Follow = c.Bool("follow")

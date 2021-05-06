@@ -51,20 +51,19 @@
 		},
 		"security_context": {
 			"readonly_rootfs": false,
+			"selinux_options": {
+				"user": "system_u",
+				"role": "system_r",
+				"type": "svirt_lxc_net_t",
+				"level": "s0:c4,c5"
+			},
 			"capabilities": {
 				"add_capabilities": [
 					"setuid",
 					"setgid"
 				],
 				"drop_capabilities": [
-					"audit_read"
 				]
-			},
-			"selinux_options": {
-				"user": "system_u",
-				"role": "system_r",
-				"type": "container_t",
-				"level": "s0:c4,c5"
 			}
 		}
 	}

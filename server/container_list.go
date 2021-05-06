@@ -1,11 +1,13 @@
 package server
 
 import (
+	"time"
+
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"k8s.io/apimachinery/pkg/fields"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 // filterContainer returns whether passed container matches filtering criteria
@@ -27,41 +29,49 @@ func filterContainer(c *pb.Container, filter *pb.ContainerFilter) bool {
 }
 
 // ListContainers lists all containers by filters.
-func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersRequest) (*pb.ListContainersResponse, error) {
+func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersRequest) (resp *pb.ListContainersResponse, err error) {
+	const operation = "list_containers"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("ListContainersRequest %+v", req)
+
 	var ctrs []*pb.Container
-	filter := req.Filter
+	filter := req.GetFilter()
 	ctrList, err := s.ContainerServer.ListContainers()
 	if err != nil {
 		return nil, err
 	}
 
-	// Filter using container id and pod id first.
-	if filter.Id != "" {
-		id, err := s.CtrIDIndex().Get(filter.Id)
-		if err != nil {
-			return nil, err
-		}
-		c := s.ContainerServer.GetContainer(id)
-		if c != nil {
-			if filter.PodSandboxId != "" {
-				if c.Sandbox() == filter.PodSandboxId {
-					ctrList = []*oci.Container{c}
-				} else {
-					ctrList = []*oci.Container{}
-				}
-
-			} else {
-				ctrList = []*oci.Container{c}
+	if filter != nil {
+		// Filter using container id and pod id first.
+		if filter.Id != "" {
+			id, err := s.CtrIDIndex().Get(filter.Id)
+			if err != nil {
+				return nil, err
 			}
-		}
-	} else {
-		if filter.PodSandboxId != "" {
-			pod := s.ContainerServer.GetSandbox(filter.PodSandboxId)
-			if pod == nil {
-				ctrList = []*oci.Container{}
-			} else {
-				ctrList = pod.Containers().List()
+			c := s.ContainerServer.GetContainer(id)
+			if c != nil {
+				if filter.PodSandboxId != "" {
+					if c.Sandbox() == filter.PodSandboxId {
+						ctrList = []*oci.Container{c}
+					} else {
+						ctrList = []*oci.Container{}
+					}
+
+				} else {
+					ctrList = []*oci.Container{c}
+				}
+			}
+		} else {
+			if filter.PodSandboxId != "" {
+				pod := s.ContainerServer.GetSandbox(filter.PodSandboxId)
+				if pod == nil {
+					ctrList = []*oci.Container{}
+				} else {
+					ctrList = pod.Containers().List()
+				}
 			}
 		}
 	}
@@ -101,7 +111,7 @@ func (s *Server) ListContainers(ctx context.Context, req *pb.ListContainersReque
 		}
 	}
 
-	resp := &pb.ListContainersResponse{
+	resp = &pb.ListContainersResponse{
 		Containers: ctrs,
 	}
 	logrus.Debugf("ListContainersResponse: %+v", resp)

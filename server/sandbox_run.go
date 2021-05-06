@@ -3,8 +3,9 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"net"
+	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 	"github.com/kubernetes-incubator/cri-o/libkpod/sandbox"
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/kubernetes-incubator/cri-o/pkg/annotations"
-	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -23,8 +24,10 @@ import (
 	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
 	"k8s.io/kubernetes/pkg/api/v1"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
+	"k8s.io/kubernetes/pkg/kubelet/leaky"
 	"k8s.io/kubernetes/pkg/kubelet/network/hostport"
+	"k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 const (
@@ -33,6 +36,8 @@ const (
 	// TODO: Remove this const once this value is provided over CRI
 	// See https://github.com/kubernetes/kubernetes/issues/47938
 	PodInfraOOMAdj int = -998
+	// PodInfraCPUshares is default cpu shares for sandbox container.
+	PodInfraCPUshares = 2
 )
 
 // privilegedSandbox returns true if the sandbox configuration
@@ -90,11 +95,17 @@ var (
 
 // RunPodSandbox creates and runs a pod-level sandbox.
 func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest) (resp *pb.RunPodSandboxResponse, err error) {
+	const operation = "run_pod_sandbox"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
+
 	s.updateLock.RLock()
 	defer s.updateLock.RUnlock()
 
 	logrus.Debugf("RunPodSandboxRequest %+v", req)
-	var processLabel, mountLabel, netNsPath, resolvPath string
+	var processLabel, mountLabel, resolvPath string
 	// process req.Name
 	kubeName := req.GetConfig().GetMetadata().Name
 	if kubeName == "" {
@@ -184,12 +195,6 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 		g.SetProcessArgs([]string{s.config.PauseCommand})
 	}
 
-	// set hostname
-	hostname := req.GetConfig().Hostname
-	if hostname != "" {
-		g.SetHostname(hostname)
-	}
-
 	// set DNS options
 	if req.GetConfig().GetDnsConfig() != nil {
 		dnsServers := req.GetConfig().GetDnsConfig().Servers
@@ -205,6 +210,10 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 			}
 			return nil, err
 		}
+		if err := label.Relabel(resolvPath, mountLabel, true); err != nil && err != unix.ENOTSUP {
+			return nil, err
+		}
+
 		g.AddBindMount(resolvPath, "/etc/resolv.conf", []string{"ro"})
 	}
 
@@ -217,9 +226,19 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 
 	// add labels
 	labels := req.GetConfig().GetLabels()
-	labelsJSON, err := json.Marshal(labels)
-	if err != nil {
+
+	if err := validateLabels(labels); err != nil {
 		return nil, err
+	}
+
+	// Add special container name label for the infra container
+	labelsJSON := []byte{}
+	if labels != nil {
+		labels[types.KubernetesContainerNameLabel] = leaky.PodInfraContainerName
+		labelsJSON, err = json.Marshal(labels)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// add annotations
@@ -242,19 +261,33 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 		return nil, fmt.Errorf("requested logDir for sbox id %s is a relative path: %s", id, logDir)
 	}
 
-	// Don't use SELinux separation with Host Pid or IPC Namespace,
-	if !req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostPid && !req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostIpc {
-		processLabel, mountLabel, err = getSELinuxLabels(nil)
-		if err != nil {
-			return nil, err
-		}
-		g.SetProcessSelinuxLabel(processLabel)
-		g.SetLinuxMountLabel(mountLabel)
+	privileged := s.privilegedSandbox(req)
+
+	securityContext := req.GetConfig().GetLinux().GetSecurityContext()
+	if securityContext == nil {
+		return nil, fmt.Errorf("no security context found")
 	}
+
+	processLabel, mountLabel, err = getSELinuxLabels(securityContext.GetSelinuxOptions(), privileged)
+	if err != nil {
+		return nil, err
+	}
+
+	// Don't use SELinux separation with Host Pid or IPC Namespace or privileged.
+	namespaceOptions := securityContext.GetNamespaceOptions()
+	if namespaceOptions == nil {
+		return nil, fmt.Errorf("no namespace options found")
+	}
+
+	if securityContext.GetNamespaceOptions().HostPid || securityContext.GetNamespaceOptions().HostIpc {
+		processLabel, mountLabel = "", ""
+	}
+	g.SetProcessSelinuxLabel(processLabel)
+	g.SetLinuxMountLabel(mountLabel)
 
 	// create shm mount for the pod containers.
 	var shmPath string
-	if req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostIpc {
+	if namespaceOptions.HostIpc {
 		shmPath = "/dev/shm"
 	} else {
 		shmPath, err = setupShm(podContainer.RunDir, mountLabel)
@@ -295,7 +328,14 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 		return nil, err
 	}
 
-	privileged := s.privilegedSandbox(req)
+	hostNetwork := namespaceOptions.HostNetwork
+
+	hostname, err := getHostname(id, req.GetConfig().Hostname, hostNetwork)
+	if err != nil {
+		return nil, err
+	}
+	g.SetHostname(hostname)
+
 	trusted := s.trustedSandbox(req)
 	g.AddAnnotation(annotations.Metadata, string(metadataJSON))
 	g.AddAnnotation(annotations.Labels, string(labelsJSON))
@@ -325,15 +365,22 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 	// setup cgroup settings
 	cgroupParent := req.GetConfig().GetLinux().CgroupParent
 	if cgroupParent != "" {
-		if s.config.CgroupManager == "systemd" {
-			cgPath, err := convertCgroupNameToSystemd(cgroupParent, false)
+		if s.config.CgroupManager == oci.SystemdCgroupsManager {
+			if len(cgroupParent) <= 6 || !strings.HasSuffix(path.Base(cgroupParent), ".slice") {
+				return nil, fmt.Errorf("cri-o configured with systemd cgroup manager, but did not receive slice as parent: %s", cgroupParent)
+			}
+			cgPath, err := convertCgroupFsNameToSystemd(cgroupParent)
 			if err != nil {
 				return nil, err
 			}
 			g.SetLinuxCgroupsPath(cgPath + ":" + "crio" + ":" + id)
 			cgroupParent = cgPath
 		} else {
-			g.SetLinuxCgroupsPath(cgroupParent + "/" + id)
+			if strings.HasSuffix(path.Base(cgroupParent), ".slice") {
+				return nil, fmt.Errorf("cri-o configured with cgroupfs cgroup manager, but received systemd slice as parent: %s", cgroupParent)
+			}
+			cgPath := filepath.Join(cgroupParent, scopePrefix+"-"+id)
+			g.SetLinuxCgroupsPath(cgPath)
 		}
 	}
 
@@ -364,6 +411,9 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 	for k, v := range kubeAnnotations {
 		g.AddAnnotation(k, v)
 	}
+	for k, v := range labels {
+		g.AddAnnotation(k, v)
+	}
 
 	// extract linux sysctls from annotations and pass down to oci runtime
 	safe, unsafe, err := SysctlsFromPodAnnotations(kubeAnnotations)
@@ -381,16 +431,11 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 	// so it doesn't get killed.
 	g.SetProcessOOMScoreAdj(PodInfraOOMAdj)
 
-	hostNetwork := req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostNetwork
+	g.SetLinuxResourcesCPUShares(PodInfraCPUshares)
 
 	// set up namespaces
 	if hostNetwork {
-		err = g.RemoveLinuxNamespace("network")
-		if err != nil {
-			return nil, err
-		}
-
-		netNsPath, err = sandbox.HostNetNsPath()
+		err = g.RemoveLinuxNamespace(string(runtimespec.NetworkNamespace))
 		if err != nil {
 			return nil, err
 		}
@@ -411,23 +456,21 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 		}()
 
 		// Pass the created namespace path to the runtime
-		err = g.AddOrReplaceLinuxNamespace("network", sb.NetNsPath())
-		if err != nil {
-			return nil, err
-		}
-
-		netNsPath = sb.NetNsPath()
-	}
-
-	if req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostPid {
-		err = g.RemoveLinuxNamespace("pid")
+		err = g.AddOrReplaceLinuxNamespace(string(runtimespec.NetworkNamespace), sb.NetNsPath())
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	if req.GetConfig().GetLinux().GetSecurityContext().GetNamespaceOptions().HostIpc {
-		err = g.RemoveLinuxNamespace("ipc")
+	if securityContext.GetNamespaceOptions().GetHostPid() {
+		err = g.RemoveLinuxNamespace(string(runtimespec.PIDNamespace))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if securityContext.GetNamespaceOptions().GetHostIpc() {
+		err = g.RemoveLinuxNamespace(string(runtimespec.IPCNamespace))
 		if err != nil {
 			return nil, err
 		}
@@ -442,7 +485,43 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount container %s in pod sandbox %s(%s): %v", containerName, sb.Name(), id, err)
 	}
+	g.AddAnnotation(annotations.MountPoint, mountPoint)
 	g.SetRootPath(mountPoint)
+
+	hostnamePath := fmt.Sprintf("%s/hostname", podContainer.RunDir)
+	if err := ioutil.WriteFile(hostnamePath, []byte(hostname+"\n"), 0644); err != nil {
+		return nil, err
+	}
+	if err := label.Relabel(hostnamePath, mountLabel, true); err != nil && err != unix.ENOTSUP {
+		return nil, err
+	}
+	g.AddBindMount(hostnamePath, "/etc/hostname", []string{"ro"})
+	g.AddAnnotation(annotations.HostnamePath, hostnamePath)
+	sb.AddHostnamePath(hostnamePath)
+
+	container, err := oci.NewContainer(id, containerName, podContainer.RunDir, logPath, sb.NetNs(), labels, g.Spec().Annotations, kubeAnnotations, "", "", "", nil, id, false, false, false, sb.Privileged(), sb.Trusted(), podContainer.Dir, created, podContainer.Config.Config.StopSignal)
+	if err != nil {
+		return nil, err
+	}
+	container.SetSpec(g.Spec())
+	container.SetMountPoint(mountPoint)
+
+	sb.SetInfraContainer(container)
+
+	var ip string
+	ip, err = s.networkStart(hostNetwork, sb)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			s.networkStop(hostNetwork, sb)
+		}
+	}()
+
+	g.AddAnnotation(annotations.IP, ip)
+	sb.AddIP(ip)
+
 	err = g.SaveToFile(filepath.Join(podContainer.Dir, "config.json"), saveOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to save template configuration for pod sandbox %s(%s): %v", sb.Name(), id, err)
@@ -451,45 +530,11 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
 		return nil, fmt.Errorf("failed to write runtime configuration for pod sandbox %s(%s): %v", sb.Name(), id, err)
 	}
 
-	container, err := oci.NewContainer(id, containerName, podContainer.RunDir, logPath, sb.NetNs(), labels, kubeAnnotations, "", "", "", nil, id, false, false, false, sb.Privileged(), sb.Trusted(), podContainer.Dir, created, podContainer.Config.Config.StopSignal)
-	if err != nil {
-		return nil, err
-	}
-
-	sb.SetInfraContainer(container)
-
-	// setup the network
-	if !hostNetwork {
-		if err = s.netPlugin.SetUpPod(netNsPath, namespace, kubeName, id); err != nil {
-			return nil, fmt.Errorf("failed to create network for container %s in sandbox %s: %v", containerName, id, err)
-		}
-
-		if len(portMappings) != 0 {
-			ip, err := s.netPlugin.GetContainerNetworkStatus(netNsPath, namespace, id, containerName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get network status for container %s in sandbox %s: %v", containerName, id, err)
-			}
-
-			ip4 := net.ParseIP(ip).To4()
-			if ip4 == nil {
-				return nil, fmt.Errorf("failed to get valid ipv4 address for container %s in sandbox %s", containerName, id)
-			}
-
-			if err = s.hostportManager.Add(id, &hostport.PodPortMapping{
-				Name:         name,
-				PortMappings: portMappings,
-				IP:           ip4,
-				HostNetwork:  false,
-			}, "lo"); err != nil {
-				return nil, fmt.Errorf("failed to add hostport mapping for container %s in sandbox %s: %v", containerName, id, err)
-			}
-
-		}
-	}
-
 	if err = s.runContainer(container, sb.CgroupParent()); err != nil {
 		return nil, err
 	}
+
+	s.addInfraContainer(container)
 
 	s.ContainerStateToDisk(container)
 
@@ -514,6 +559,23 @@ func convertPortMappings(in []*pb.PortMapping) []*hostport.PortMapping {
 	return out
 }
 
+func getHostname(id, hostname string, hostNetwork bool) (string, error) {
+	if hostNetwork {
+		if hostname == "" {
+			h, err := os.Hostname()
+			if err != nil {
+				return "", err
+			}
+			hostname = h
+		}
+	} else {
+		if hostname == "" {
+			hostname = id[:12]
+		}
+	}
+	return hostname, nil
+}
+
 func (s *Server) setPodSandboxMountLabel(id, mountLabel string) error {
 	storageMetadata, err := s.StorageRuntimeServer().GetContainerMetadata(id)
 	if err != nil {
@@ -523,31 +585,26 @@ func (s *Server) setPodSandboxMountLabel(id, mountLabel string) error {
 	return s.StorageRuntimeServer().SetContainerMetadata(id, storageMetadata)
 }
 
-func getSELinuxLabels(selinuxOptions *pb.SELinuxOption) (processLabel string, mountLabel string, err error) {
-	processLabel = ""
-	if selinuxOptions != nil {
-		user := selinuxOptions.User
-		if user == "" {
-			return "", "", fmt.Errorf("SELinuxOption.User is empty")
-		}
-
-		role := selinuxOptions.Role
-		if role == "" {
-			return "", "", fmt.Errorf("SELinuxOption.Role is empty")
-		}
-
-		t := selinuxOptions.Type
-		if t == "" {
-			return "", "", fmt.Errorf("SELinuxOption.Type is empty")
-		}
-
-		level := selinuxOptions.Level
-		if level == "" {
-			return "", "", fmt.Errorf("SELinuxOption.Level is empty")
-		}
-		processLabel = fmt.Sprintf("%s:%s:%s:%s", user, role, t, level)
+func getSELinuxLabels(selinuxOptions *pb.SELinuxOption, privileged bool) (processLabel string, mountLabel string, err error) {
+	if privileged {
+		return "", "", nil
 	}
-	return label.InitLabels(label.DupSecOpt(processLabel))
+	labels := []string{}
+	if selinuxOptions != nil {
+		if selinuxOptions.User != "" {
+			labels = append(labels, "user:"+selinuxOptions.User)
+		}
+		if selinuxOptions.Role != "" {
+			labels = append(labels, "role:"+selinuxOptions.Role)
+		}
+		if selinuxOptions.Type != "" {
+			labels = append(labels, "type:"+selinuxOptions.Type)
+		}
+		if selinuxOptions.Level != "" {
+			labels = append(labels, "level:"+selinuxOptions.Level)
+		}
+	}
+	return label.InitLabels(labels)
 }
 
 func setupShm(podSandboxRunDir, mountLabel string) (shmPath string, err error) {
@@ -563,40 +620,14 @@ func setupShm(podSandboxRunDir, mountLabel string) (shmPath string, err error) {
 	return shmPath, nil
 }
 
-// convertCgroupNameToSystemd converts the internal cgroup name to a systemd name.
-// For example, the name /Burstable/pod_123-456 becomes Burstable-pod_123_456.slice
-// If outputToCgroupFs is true, it expands the systemd name into the cgroupfs form.
-// For example, it will return /Burstable.slice/Burstable-pod_123_456.slice in above scenario.
-func convertCgroupNameToSystemd(name string, outputToCgroupFs bool) (systemdCgroup string, err error) {
-	result := ""
-	if name != "" && name != "/" {
-		// systemd treats - as a step in the hierarchy, we convert all - to _
-		name = strings.Replace(name, "-", "_", -1)
-		parts := strings.Split(name, "/")
-		for _, part := range parts {
-			// ignore leading stuff for now
-			if part == "" {
-				continue
-			}
-			if len(result) > 0 {
-				result = result + "-"
-			}
-			result = result + part
-		}
-	} else {
-		// root converts to -
-		result = "-"
-	}
-	// always have a .slice suffix
-	result = result + ".slice"
-
-	// if the caller desired the result in cgroupfs format...
-	if outputToCgroupFs {
-		var err error
-		result, err = systemd.ExpandSlice(result)
-		if err != nil {
-			return "", fmt.Errorf("error adapting cgroup name, input: %v, err: %v", name, err)
-		}
-	}
-	return result, nil
+// convertCgroupFsNameToSystemd converts an expanded cgroupfs name to its systemd name.
+// For example, it will convert test.slice/test-a.slice/test-a-b.slice to become test-a-b.slice
+// NOTE: this is public right now to allow its usage in dockermanager and dockershim, ideally both those
+// code areas could use something from libcontainer if we get this style function upstream.
+func convertCgroupFsNameToSystemd(cgroupfsName string) (string, error) {
+	// TODO: see if libcontainer systemd implementation could use something similar, and if so, move
+	// this function up to that library.  At that time, it would most likely do validation specific to systemd
+	// above and beyond the simple assumption here that the base of the path encodes the hierarchy
+	// per systemd convention.
+	return path.Base(cgroupfsName), nil
 }

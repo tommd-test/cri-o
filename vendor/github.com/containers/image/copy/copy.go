@@ -129,9 +129,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 		}
 	}()
 
-	destSupportedManifestMIMETypes := dest.SupportedManifestMIMETypes()
-
-	rawSource, err := srcRef.NewImageSource(options.SourceCtx, destSupportedManifestMIMETypes)
+	rawSource, err := srcRef.NewImageSource(options.SourceCtx)
 	if err != nil {
 		return errors.Wrapf(err, "Error initializing source %s", transports.ImageName(srcRef))
 	}
@@ -195,7 +193,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 
 	// We compute preferredManifestMIMEType only to show it in error messages.
 	// Without having to add this context in an error message, we would be happy enough to know only that no conversion is needed.
-	preferredManifestMIMEType, otherManifestMIMETypeCandidates, err := determineManifestConversion(&manifestUpdates, src, destSupportedManifestMIMETypes, canModifyManifest)
+	preferredManifestMIMEType, otherManifestMIMETypeCandidates, err := determineManifestConversion(&manifestUpdates, src, dest.SupportedManifestMIMETypes(), canModifyManifest)
 	if err != nil {
 		return err
 	}
@@ -583,7 +581,7 @@ func (ic *imageCopier) copyBlobFromStream(srcStream io.Reader, srcInfo types.Blo
 	bar.ShowPercent = false
 	bar.Start()
 	destStream = bar.NewProxyReader(destStream)
-	defer fmt.Fprint(ic.reportWriter, "\n")
+	defer bar.Finish()
 
 	// === Send a copy of the original, uncompressed, stream, to a separate path if necessary.
 	var originalLayerReader io.Reader // DO NOT USE this other than to drain the input if no other consumer in the pipeline has done so.

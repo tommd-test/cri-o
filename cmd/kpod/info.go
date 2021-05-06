@@ -36,6 +36,9 @@ var (
 )
 
 func infoCmd(c *cli.Context) error {
+	if err := validateFlags(c, infoFlags); err != nil {
+		return err
+	}
 	info := map[string]interface{}{}
 
 	infoGivers := []infoGiverFunc{
@@ -85,6 +88,8 @@ func debugInfo(c *cli.Context) (string, map[string]interface{}, error) {
 	info := map[string]interface{}{}
 	info["compiler"] = runtime.Compiler
 	info["go version"] = runtime.Version()
+	info["kpod version"] = c.App.Version
+	info["git commit"] = gitCommit
 	return "debug", info, nil
 }
 
@@ -139,7 +144,18 @@ func storeInfo(c *cli.Context) (string, map[string]interface{}, error) {
 	// lets say storage driver in use, number of images, number of containers
 	info := map[string]interface{}{}
 	info["GraphRoot"] = store.GraphRoot()
+	info["RunRoot"] = store.RunRoot()
 	info["GraphDriverName"] = store.GraphDriverName()
+	info["GraphOptions"] = store.GraphOptions()
+	statusPairs, err := store.Status()
+	if err != nil {
+		return storeStr, nil, err
+	}
+	status := map[string]string{}
+	for _, pair := range statusPairs {
+		status[pair[0]] = pair[1]
+	}
+	info["GraphStatus"] = status
 	images, err := store.Images()
 	if err != nil {
 		info["ImageStore"] = infoErr(err)

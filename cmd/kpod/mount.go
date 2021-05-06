@@ -51,8 +51,8 @@ type jsonMountPoint struct {
 
 func mountCmd(c *cli.Context) error {
 	formats := map[string]bool{
-		"":     true,
-		"json": true,
+		"":            true,
+		of.JSONString: true,
 	}
 
 	args := c.Args()
@@ -63,6 +63,9 @@ func mountCmd(c *cli.Context) error {
 
 	if len(args) > 1 {
 		return errors.Errorf("too many arguments specified")
+	}
+	if err := validateFlags(c, mountFlags); err != nil {
+		return err
 	}
 	config, err := getConfig(c)
 	if err != nil {

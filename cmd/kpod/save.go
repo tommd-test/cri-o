@@ -1,24 +1,14 @@
 package main
 
 import (
+	"io"
 	"os"
 
-	"github.com/containers/storage"
-	libkpodimage "github.com/kubernetes-incubator/cri-o/libkpod/image"
+	"github.com/kubernetes-incubator/cri-o/libpod"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
-
-const (
-	dockerArchive = "docker-archive:"
-)
-
-type saveOptions struct {
-	output string
-	quiet  bool
-	images []string
-}
 
 var (
 	saveFlags = []cli.Flag{
@@ -31,9 +21,16 @@ var (
 			Name:  "quiet, q",
 			Usage: "Suppress the output",
 		},
+		cli.StringFlag{
+			Name:  "format",
+			Usage: "Save image to oci-archive",
+		},
 	}
-	saveDescription = "Save an image to docker-archive on the local machine"
-	saveCommand     = cli.Command{
+	saveDescription = `
+	Save an image to docker-archive or oci-archive on the local machine.
+	Default is docker-archive`
+
+	saveCommand = cli.Command{
 		Name:        "save",
 		Usage:       "Save image to an archive",
 		Description: saveDescription,
@@ -49,19 +46,22 @@ func saveCmd(c *cli.Context) error {
 	if len(args) == 0 {
 		return errors.Errorf("need at least 1 argument")
 	}
-
-	config, err := getConfig(c)
-	if err != nil {
-		return errors.Wrapf(err, "could not get config")
-	}
-	store, err := getStore(config)
-	if err != nil {
+	if err := validateFlags(c, saveFlags); err != nil {
 		return err
 	}
 
-	output := c.String("output")
-	quiet := c.Bool("quiet")
+	runtime, err := getRuntime(c)
+	if err != nil {
+		return errors.Wrapf(err, "could not create runtime")
+	}
+	defer runtime.Shutdown(false)
 
+	var writer io.Writer
+	if !c.Bool("quiet") {
+		writer = os.Stdout
+	}
+
+	output := c.String("output")
 	if output == "/dev/stdout" {
 		fi := os.Stdout
 		if logrus.IsTerminal(fi) {
@@ -69,30 +69,27 @@ func saveCmd(c *cli.Context) error {
 		}
 	}
 
-	opts := saveOptions{
-		output: output,
-		quiet:  quiet,
-		images: args,
+	var dst string
+	switch c.String("format") {
+	case libpod.OCIArchive:
+		dst = libpod.OCIArchive + ":" + output
+	case libpod.DockerArchive:
+		fallthrough
+	case "":
+		dst = libpod.DockerArchive + ":" + output
+	default:
+		return errors.Errorf("unknown format option %q", c.String("format"))
 	}
 
-	return saveImage(store, opts)
-}
-
-// saveImage pushes the image to docker-archive or oci by
-// calling pushImage
-func saveImage(store storage.Store, opts saveOptions) error {
-	dst := dockerArchive + opts.output
-
-	pushOpts := libkpodimage.CopyOptions{
+	saveOpts := libpod.CopyOptions{
 		SignaturePolicyPath: "",
-		Store:               store,
 	}
 
 	// only one image is supported for now
 	// future pull requests will fix this
-	for _, image := range opts.images {
+	for _, image := range args {
 		dest := dst + ":" + image
-		if err := libkpodimage.PushImage(image, dest, pushOpts); err != nil {
+		if err := runtime.PushImage(image, dest, saveOpts, writer); err != nil {
 			return errors.Wrapf(err, "unable to save %q", image)
 		}
 	}

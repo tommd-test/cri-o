@@ -3,36 +3,41 @@
 # kpod-save "1" "July 2017" "kpod"
 
 ## NAME
-kpod-save - Save an image to docker-archive or oci
+kpod-save - Save an image to docker-archive or oci-archive
 
 ## SYNOPSIS
 **kpod save**
 **NAME[:TAG]**
+[**--quiet**|**-q**]
+[**--format**]
+[**--output**|**-o**]
 [**--help**|**-h**]
 
 ## DESCRIPTION
-**kpod save** saves an image to either **docker-archive** on the loacl machine.
-**kpod save** writes to STDOUT by default and can be redirected to a file
-using the **output** flag. The **quiet** flag suppresses the output when set.
+**kpod save** saves an image to either **docker-archive** or **oci-archive**
+on the local machine, default is **docker-archive**.
+**kpod save** writes to STDOUT by default and can be redirected to a file using the **output** flag.
+The **quiet** flag suppresses the output when set.
 
 **kpod [GLOBAL OPTIONS]**
 
 **kpod save [GLOBAL OPTIONS]**
 
-**kpod save [OPTIONS] NAME[:TAG] [GLOBAL OPTIONS]**
+**kpod save [OPTIONS] NAME[:TAG]**
 
 ## OPTIONS
 
 **--output, -o**
 Write to a file, default is STDOUT
 
+**--format**
+Save image to **oci-archive**
+```
+--format oci-archive
+```
+
 **--quiet, -q**
 Suppress the output
-
-## GLOBAL OPTIONS
-
-**--help, -h**
-  Print usage statement
 
 ## EXAMPLES
 
@@ -42,6 +47,10 @@ Suppress the output
 
 ```
 # kpod save > alpine-all.tar alpine
+```
+
+```
+# kpod save -o oci-alpine.tar --format oci-archive alpine
 ```
 
 ## SEE ALSO

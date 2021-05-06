@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
+
 	"github.com/containers/storage/pkg/archive"
 	"github.com/kubernetes-incubator/cri-o/cmd/kpod/formats"
-	"github.com/kubernetes-incubator/cri-o/libkpod"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 )
@@ -74,22 +74,22 @@ func formatJSON(output []diffOutputParams) (diffJSONOutput, error) {
 }
 
 func diffCmd(c *cli.Context) error {
-	if len(c.Args()) != 1 {
-		return errors.Errorf("container, layer, or image name must be specified: kpod diff [options [...]] ID-NAME")
-	}
-	config, err := getConfig(c)
-	if err != nil {
-		return errors.Wrapf(err, "could not get config")
+	if err := validateFlags(c, diffFlags); err != nil {
+		return err
 	}
 
-	server, err := libkpod.New(config)
-	if err != nil {
-		return errors.Wrapf(err, "could not get container server")
+	if len(c.Args()) != 1 {
+		return errors.Errorf("container, image, or layer name must be specified: kpod diff [options [...]] ID-NAME")
 	}
-	defer server.Shutdown()
+
+	runtime, err := getRuntime(c)
+	if err != nil {
+		return errors.Wrapf(err, "could not get runtime")
+	}
+	defer runtime.Shutdown(false)
 
 	to := c.Args().Get(0)
-	changes, err := server.GetDiff("", to)
+	changes, err := runtime.GetDiff("", to)
 	if err != nil {
 		return errors.Wrapf(err, "could not get changes for %q", to)
 	}

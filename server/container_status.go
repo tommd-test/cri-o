@@ -1,10 +1,12 @@
 package server
 
 import (
+	"time"
+
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 const (
@@ -14,7 +16,12 @@ const (
 )
 
 // ContainerStatus returns status of the container.
-func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (*pb.ContainerStatusResponse, error) {
+func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (resp *pb.ContainerStatusResponse, err error) {
+	const operation = "container_status"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("ContainerStatusRequest %+v", req)
 	c, err := s.GetContainerFromRequest(req.ContainerId)
 	if err != nil {
@@ -22,7 +29,7 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 	}
 
 	containerID := c.ID()
-	resp := &pb.ContainerStatusResponse{
+	resp = &pb.ContainerStatusResponse{
 		Status: &pb.ContainerStatus{
 			Id:          containerID,
 			Metadata:    c.Metadata(),
@@ -48,7 +55,6 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 
 	// If we defaulted to exit code -1 earlier then we attempt to
 	// get the exit code from the exit file again.
-	// TODO: We could wait in UpdateStatus for exit file to show up.
 	if cState.ExitCode == -1 {
 		err := s.Runtime().UpdateStatus(c)
 		if err != nil {

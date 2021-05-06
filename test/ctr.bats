@@ -255,6 +255,53 @@ function teardown() {
 	stop_crio
 }
 
+@test "ctr log max" {
+	LOG_SIZE_MAX_LIMIT=10000 start_crio
+	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crioctl pod list
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	# Create a new container.
+	newconfig=$(mktemp --tmpdir crio-config.XXXXXX.json)
+	cp "$TESTDATA"/container_config_logging.json "$newconfig"
+	sed -i 's|"%shellcommand%"|"for i in $(seq 250); do echo $i; done"|' "$newconfig"
+	run crioctl ctr create --config "$newconfig" --pod "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crioctl ctr start --id "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	sleep 6
+	run crioctl ctr status --id "$ctr_id"
+	[ "$status" -eq 0 ]
+	run crioctl ctr remove --id "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	# Check that the output is what we expect.
+	logpath="$DEFAULT_LOG_PATH/$pod_id/$ctr_id.log"
+	[ -f "$logpath" ]
+	echo "$logpath :: $(cat "$logpath")"
+	len=$(wc -l "$logpath" | awk '{print $1}')
+	[ $len -lt 250 ]
+
+	run crioctl pod stop --id "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crioctl pod remove --id "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
 # regression test for #127
 @test "ctrs status for a pod" {
 	start_crio
@@ -513,6 +560,7 @@ function teardown() {
 	run crioctl ctr execsync --id "$ctr_id" --timeout 1 sleep 10
 	echo "$output"
 	[[ "$output" =~ "command timed out" ]]
+	[ "$status" -ne 0 ]
 	run crioctl pod stop --id "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -541,6 +589,31 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "/dev/mynull" ]]
+	run crioctl pod stop --id "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crioctl pod remove --id "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr hostname env" {
+	start_crio
+	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crioctl ctr create --config "$TESTDATA"/container_config.json --pod "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crioctl ctr execsync --id "$ctr_id" env
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "HOSTNAME" ]]
 	run crioctl pod stop --id "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
@@ -719,10 +792,16 @@ function teardown() {
 	echo "$output"
 	[ "$status" -eq 0 ]
 	# Wait for container to OOM
-	run sleep 10
-	run crioctl ctr status --id "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	attempt=0
+	while [ $attempt -le 100 ]; do
+		attempt=$((attempt+1))
+		run crioctl ctr status --id "$ctr_id"
+		echo "$output"
+		if [[ "$output" =~ "OOMKilled" ]]; then
+			break
+		fi
+		sleep 10
+	done
 	[[ "$output" =~ "OOMKilled" ]]
 	run crioctl pod stop --id "$pod_id"
 	echo "$output"
@@ -813,6 +892,62 @@ function teardown() {
 	run crioctl pod remove --id "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr correctly setup working directory" {
+	start_crio
+	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	notexistcwd=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["working_dir"] = "/thisshouldntexistatall"; json.dump(obj, sys.stdout)')
+	echo "$notexistcwd" > "$TESTDIR"/container_cwd_notexist.json
+	run crioctl ctr create --config "$TESTDIR"/container_cwd_notexist.json --pod "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crioctl ctr start --id "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	filecwd=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["working_dir"] = "/etc/passwd"; obj["metadata"]["name"] = "container2"; json.dump(obj, sys.stdout)')
+	echo "$filecwd" > "$TESTDIR"/container_cwd_file.json
+	run crioctl ctr create --config "$TESTDIR"/container_cwd_file.json --pod "$pod_id"
+	echo "$output"
+	[ "$status" -ne 0 ]
+	ctr_id="$output"
+	[[ "$output" =~ "not a directory" ]]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr execsync conflicting with conmon env" {
+	start_crio
+	run crictl runs "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis_env_custom.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl exec "$ctr_id" env
+	echo "$output"
+	echo "$status"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "acustompathinpath" ]]
+	run crictl exec --sync "$ctr_id" env
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "acustompathinpath" ]]
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio

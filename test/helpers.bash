@@ -10,15 +10,16 @@ TESTDATA="${INTEGRATION_ROOT}/testdata"
 CRIO_ROOT=${CRIO_ROOT:-$(cd "$INTEGRATION_ROOT/../.."; pwd -P)}
 
 # Path of the crio binary.
-CRIO_BINARY=${CRIO_BINARY:-${CRIO_ROOT}/cri-o/crio}
-# Path of the crioctl binary.
-OCIC_BINARY=${OCIC_BINARY:-${CRIO_ROOT}/cri-o/crioctl}
+CRIO_BINARY=${CRIO_BINARY:-${CRIO_ROOT}/cri-o/bin/crio}
+# Path of the crictl binary.
+CRICTL_PATH=$(command -v crictl || true)
+CRICTL_BINARY=${CRICTL_PATH:-/usr/bin/crictl}
 # Path to kpod binary.
-KPOD_BINARY=${KPOD_BINARY:-${CRIO_ROOT}/cri-o/kpod}
+KPOD_BINARY=${KPOD_BINARY:-${CRIO_ROOT}/cri-o/bin/kpod}
 # Path of the conmon binary.
-CONMON_BINARY=${CONMON_BINARY:-${CRIO_ROOT}/cri-o/conmon/conmon}
+CONMON_BINARY=${CONMON_BINARY:-${CRIO_ROOT}/cri-o/bin/conmon}
 # Path of the pause binary.
-PAUSE_BINARY=${PAUSE_BINARY:-${CRIO_ROOT}/cri-o/pause/pause}
+PAUSE_BINARY=${PAUSE_BINARY:-${CRIO_ROOT}/cri-o/bin/pause}
 # Path of the default seccomp profile.
 SECCOMP_PROFILE=${SECCOMP_PROFILE:-${CRIO_ROOT}/cri-o/seccomp.json}
 # Name of the default apparmor profile.
@@ -55,8 +56,27 @@ CGROUP_MANAGER=${CGROUP_MANAGER:-cgroupfs}
 IMAGE_VOLUMES=${IMAGE_VOLUMES:-mkdir}
 # Container pids limit
 PIDS_LIMIT=${PIDS_LIMIT:-1024}
+# Log size max limit
+LOG_SIZE_MAX_LIMIT=${LOG_SIZE_MAX_LIMIT:--1}
 
 TESTDIR=$(mktemp -d)
+
+# kpod pull needs a configuration file for shortname pulls
+export REGISTRIES_CONFIG_PATH="$INTEGRATION_ROOT/registries.conf"
+
+# Setup default hooks dir
+HOOKSDIR=$TESTDIR/hooks
+mkdir ${HOOKSDIR}
+HOOKS_OPTS="--hooks-dir-path=$HOOKSDIR"
+
+# Setup default secrets mounts
+MOUNT_PATH="$TESTDIR/secrets"
+mkdir ${MOUNT_PATH}
+MOUNT_FILE="${MOUNT_PATH}/test.txt"
+touch ${MOUNT_FILE}
+echo "Testing secrets mounts!" > ${MOUNT_FILE}
+
+DEFAULT_MOUNTS_OPTS="--default-mounts=${MOUNT_PATH}:/container/path1"
 
 # We may need to set some default storage options.
 case "$(stat -f -c %T ${TESTDIR})" in
@@ -75,9 +95,11 @@ fi
 CRIO_SOCKET="$TESTDIR/crio.sock"
 CRIO_CONFIG="$TESTDIR/crio.conf"
 CRIO_CNI_CONFIG="$TESTDIR/cni/net.d/"
-CRIO_CNI_PLUGIN="/opt/cni/bin/"
+CRIO_CNI_PLUGIN=${CRIO_CNI_PLUGIN:-/opt/cni/bin/}
 POD_CIDR="10.88.0.0/16"
 POD_CIDR_MASK="10.88.*.*"
+
+KPOD_OPTIONS="--root $TESTDIR/crio $STORAGE_OPTS --runroot $TESTDIR/crio-run --runtime ${RUNTIME_BINARY}"
 
 cp "$CONMON_BINARY" "$TESTDIR/conmon"
 
@@ -151,9 +173,16 @@ function crio() {
 	"$CRIO_BINARY" --listen "$CRIO_SOCKET" "$@"
 }
 
+# DEPRECATED
+OCIC_BINARY=${OCIC_BINARY:-${CRIO_ROOT}/cri-o/bin/crioctl}
 # Run crioctl using the binary specified by $OCIC_BINARY.
 function crioctl() {
 	"$OCIC_BINARY" --connect "$CRIO_SOCKET" "$@"
+}
+
+# Run crictl using the binary specified by $CRICTL_BINARY.
+function crictl() {
+	"$CRICTL_BINARY" -r "$CRIO_SOCKET" -i "$CRIO_SOCKET" "$@"
 }
 
 # Communicate with Docker on the host machine.
@@ -182,9 +211,9 @@ function retry() {
 	false
 }
 
-# Waits until the given crio becomes reachable.
+# Waits until crio becomes reachable.
 function wait_until_reachable() {
-	retry 15 1 crioctl runtimeversion
+	retry 15 1 crictl version
 }
 
 # Start crio.
@@ -215,7 +244,7 @@ function start_crio() {
 	"$COPYIMG_BINARY" --root "$TESTDIR/crio" $STORAGE_OPTS --runroot "$TESTDIR/crio-run" --image-name=mrunalp/image-volume-test --import-from=dir:"$ARTIFACTS_PATH"/image-volume-test-image --add-name=docker.io/library/mrunalp/image-volume-test --signature-policy="$INTEGRATION_ROOT"/policy.json
 	"$COPYIMG_BINARY" --root "$TESTDIR/crio" $STORAGE_OPTS --runroot "$TESTDIR/crio-run" --image-name=busybox:latest --import-from=dir:"$ARTIFACTS_PATH"/busybox-image --add-name=docker.io/library/busybox:latest --signature-policy="$INTEGRATION_ROOT"/policy.json
 	"$COPYIMG_BINARY" --root "$TESTDIR/crio" $STORAGE_OPTS --runroot "$TESTDIR/crio-run" --image-name=runcom/stderr-test:latest --import-from=dir:"$ARTIFACTS_PATH"/stderr-test --add-name=docker.io/runcom/stderr-test:latest --signature-policy="$INTEGRATION_ROOT"/policy.json
-	"$CRIO_BINARY" --conmon "$CONMON_BINARY" --listen "$CRIO_SOCKET" --cgroup-manager "$CGROUP_MANAGER" --registry "docker.io" --runtime "$RUNTIME_BINARY" --root "$TESTDIR/crio" --runroot "$TESTDIR/crio-run" $STORAGE_OPTS --seccomp-profile "$seccomp" --apparmor-profile "$apparmor" --cni-config-dir "$CRIO_CNI_CONFIG" --signature-policy "$INTEGRATION_ROOT"/policy.json --image-volumes "$IMAGE_VOLUMES" --pids-limit "$PIDS_LIMIT" --config /dev/null config >$CRIO_CONFIG
+	"$CRIO_BINARY" ${DEFAULT_MOUNTS_OPTS} ${HOOKS_OPTS} --conmon "$CONMON_BINARY" --listen "$CRIO_SOCKET" --cgroup-manager "$CGROUP_MANAGER" --registry "docker.io" --runtime "$RUNTIME_BINARY" --root "$TESTDIR/crio" --runroot "$TESTDIR/crio-run" $STORAGE_OPTS --seccomp-profile "$seccomp" --apparmor-profile "$apparmor" --cni-config-dir "$CRIO_CNI_CONFIG" --cni-plugin-dir "$CRIO_CNI_PLUGIN" --signature-policy "$INTEGRATION_ROOT"/policy.json --image-volumes "$IMAGE_VOLUMES" --pids-limit "$PIDS_LIMIT" --log-size-max "$LOG_SIZE_MAX_LIMIT" --config /dev/null config >$CRIO_CONFIG
 
 	# Prepare the CNI configuration files, we're running with non host networking by default
 	if [[ -n "$4" ]]; then
@@ -225,17 +254,17 @@ function start_crio() {
 	fi
 	${netfunc} $POD_CIDR
 
-	"$CRIO_BINARY" --debug --config "$CRIO_CONFIG" & CRIO_PID=$!
+	"$CRIO_BINARY" --log-level debug --config "$CRIO_CONFIG" & CRIO_PID=$!
 	wait_until_reachable
 
-	run crioctl image status --id=redis:alpine
+	run crictl inspecti redis:alpine
 	if [ "$status" -ne 0 ] ; then
-		crioctl image pull redis:alpine
+		crictl pull redis:alpine
 	fi
-	REDIS_IMAGEID=$(crioctl image status --id=redis:alpine | head -1 | sed -e "s/ID: //g")
-	run crioctl image status --id=mrunalp/oom
+	REDIS_IMAGEID=$(crictl inspecti redis:alpine | head -1 | sed -e "s/ID: //g")
+	run crictl inspecti mrunalp/oom
 	if [ "$status" -ne 0 ] ; then
-		  crioctl image pull mrunalp/oom
+		  crictl pull mrunalp/oom
 	fi
 	#
 	#
@@ -248,63 +277,64 @@ function start_crio() {
 	#
 	#
 	REDIS_IMAGEID_DIGESTED="redis@sha256:03789f402b2ecfb98184bf128d180f398f81c63364948ff1454583b02442f73b"
-	run crioctl image status --id $REDIS_IMAGEID_DIGESTED
+	run crictl inspecti $REDIS_IMAGEID_DIGESTED
 	if [ "$status" -ne 0 ]; then
-		crioctl image pull $REDIS_IMAGEID_DIGESTED
+		crictl pull $REDIS_IMAGEID_DIGESTED
 	fi
 	#
 	#
 	#
-	run crioctl image status --id=runcom/stderr-test
+	run crictl inspecti runcom/stderr-test
 	if [ "$status" -ne 0 ] ; then
-		crioctl image pull runcom/stderr-test:latest
+		crictl pull runcom/stderr-test:latest
 	fi
-	STDERR_IMAGEID=$(crioctl image status --id=runcom/stderr-test | head -1 | sed -e "s/ID: //g")
-	run crioctl image status --id=busybox
+	STDERR_IMAGEID=$(crictl inspecti runcom/stderr-test | head -1 | sed -e "s/ID: //g")
+	run crictl inspecti busybox
 	if [ "$status" -ne 0 ] ; then
-		crioctl image pull busybox:latest
+		crictl pull busybox:latest
 	fi
-	BUSYBOX_IMAGEID=$(crioctl image status --id=busybox | head -1 | sed -e "s/ID: //g")
-	run crioctl image status --id=mrunalp/image-volume-test
+	BUSYBOX_IMAGEID=$(crictl inspecti busybox | head -1 | sed -e "s/ID: //g")
+	run crictl inspecti mrunalp/image-volume-test
 	if [ "$status" -ne 0 ] ; then
-		  crioctl image pull mrunalp/image-volume-test:latest
+		  crictl pull mrunalp/image-volume-test:latest
 	fi
-	VOLUME_IMAGEID=$(crioctl image status --id=mrunalp/image-volume-test | head -1 | sed -e "s/ID: //g")
+	VOLUME_IMAGEID=$(crictl inspecti mrunalp/image-volume-test | head -1 | sed -e "s/ID: //g")
 }
 
 function cleanup_ctrs() {
-	run crioctl ctr list --quiet
+	run crictl ps --quiet
 	if [ "$status" -eq 0 ]; then
 		if [ "$output" != "" ]; then
 			printf '%s\n' "$output" | while IFS= read -r line
 			do
-			   crioctl ctr stop --id "$line"
-			   crioctl ctr remove --id "$line"
+			   crictl stop "$line"
+			   crictl rm "$line"
 			done
 		fi
 	fi
+	rm -f /run/hookscheck
 }
 
 function cleanup_images() {
-	run crioctl image list --quiet
+	run crictl images --quiet
 	if [ "$status" -eq 0 ]; then
 		if [ "$output" != "" ]; then
 			printf '%s\n' "$output" | while IFS= read -r line
 			do
-			   crioctl image remove --id "$line"
+			   crictl rmi "$line"
 			done
 		fi
 	fi
 }
 
 function cleanup_pods() {
-	run crioctl pod list --quiet
+	run crictl sandboxes --quiet
 	if [ "$status" -eq 0 ]; then
 		if [ "$output" != "" ]; then
 			printf '%s\n' "$output" | while IFS= read -r line
 			do
-			   crioctl pod stop --id "$line"
-			   crioctl pod remove --id "$line"
+			   crictl stops "$line"
+			   crictl rms "$line"
 			done
 		fi
 	fi
@@ -399,8 +429,18 @@ function prepare_plugin_test_args_network_conf() {
 	cat >$CRIO_CNI_CONFIG/10-plugin-test-args.conf <<-EOF
 {
     "cniVersion": "0.2.0",
-    "name": "crionet",
-    "type": "plugin_test_args.bash"
+    "name": "crionet_test_args",
+    "type": "bridge-custom",
+    "bridge": "cni0",
+    "isGateway": true,
+    "ipMasq": true,
+    "ipam": {
+        "type": "host-local",
+        "subnet": "$1",
+        "routes": [
+            { "dst": "0.0.0.0/0"  }
+        ]
+    }
 }
 EOF
 
@@ -408,10 +448,7 @@ EOF
 }
 
 function check_pod_cidr() {
-        fullnetns=`crioctl pod status --id $1 | grep namespace | cut -d ' ' -f 3`
-	netns=`basename $fullnetns`
-
-	run ip netns exec $netns ip addr show dev eth0 scope global 2>&1
+	run crioctl ctr execsync --id $1 ip addr show dev eth0 scope global 2>&1
 	echo "$output"
 	[ "$status" -eq 0  ]
 	[[ "$output" =~ $POD_CIDR_MASK  ]]
@@ -435,8 +472,7 @@ function get_host_ip() {
 }
 
 function ping_pod() {
-	netns=`crioctl pod status --id $1 | grep namespace | cut -d ' ' -f 3`
-	inet=`ip netns exec \`basename $netns\` ip addr show dev eth0 scope global | grep inet`
+	inet=`crioctl ctr execsync --id $1 ip addr show dev eth0 scope global 2>&1 | grep inet`
 
 	IFS=" "
 	ip=`parse_pod_ip $inet`
@@ -447,12 +483,14 @@ function ping_pod() {
 }
 
 function ping_pod_from_pod() {
-	pod_ip=`crioctl pod status --id $1 | grep "IP Address" | cut -d ' ' -f 3`
-	netns=`crioctl pod status --id $2 | grep namespace | cut -d ' ' -f 3`
+	inet=`crioctl ctr execsync --id $1 ip addr show dev eth0 scope global 2>&1 | grep inet`
 
-	ip netns exec `basename $netns` ping -W 1 -c 2 $pod_ip
+	IFS=" "
+	ip=`parse_pod_ip $inet`
 
-	echo $?
+	run crioctl ctr execsync --id $2 ping -W 1 -c 2 $ip
+	echo "$output"
+	[ "$status" -eq 0   ]
 }
 
 

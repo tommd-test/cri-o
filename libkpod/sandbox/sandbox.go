@@ -7,15 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
-	"github.com/containernetworking/cni/pkg/ns"
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/symlink"
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/fields"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 	"k8s.io/kubernetes/pkg/kubelet/network/hostport"
 )
 
@@ -151,9 +152,13 @@ type Sandbox struct {
 	privileged     bool
 	trusted        bool
 	resolvPath     string
+	hostnamePath   string
 	hostname       string
 	portMappings   []*hostport.PortMapping
 	stopped        bool
+	// ipv4 or ipv6 cache
+	ip      string
+	created time.Time
 }
 
 const (
@@ -198,8 +203,19 @@ func New(id, namespace, name, kubeName, logDir string, labels, annotations map[s
 	sb.resolvPath = resolvPath
 	sb.hostname = hostname
 	sb.portMappings = portMappings
+	sb.created = time.Now()
 
 	return sb, nil
+}
+
+// AddIP stores the ip in the sandbox
+func (s *Sandbox) AddIP(ip string) {
+	s.ip = ip
+}
+
+// IP returns the ip of the sandbox
+func (s *Sandbox) IP() string {
+	return s.ip
 }
 
 // ID returns the id of the sandbox
@@ -287,6 +303,16 @@ func (s *Sandbox) Trusted() bool {
 // ResolvPath returns the resolv path for the sandbox
 func (s *Sandbox) ResolvPath() string {
 	return s.resolvPath
+}
+
+// AddHostnamePath adds the hostname path to the sandbox
+func (s *Sandbox) AddHostnamePath(hostname string) {
+	s.hostnamePath = hostname
+}
+
+// HostnamePath retrieves the hostname path from a sandbox
+func (s *Sandbox) HostnamePath() string {
+	return s.hostnamePath
 }
 
 // Hostname returns the hsotname of the sandbox

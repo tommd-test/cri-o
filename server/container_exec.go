@@ -5,22 +5,30 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/docker/docker/pkg/pools"
 	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	"k8s.io/client-go/tools/remotecommand"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	utilexec "k8s.io/kubernetes/pkg/util/exec"
 	"k8s.io/kubernetes/pkg/util/term"
 )
 
 // Exec prepares a streaming endpoint to execute a command in the container.
-func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (*pb.ExecResponse, error) {
+func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (resp *pb.ExecResponse, err error) {
+	const operation = "exec"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
+
 	logrus.Debugf("ExecRequest %+v", req)
 
-	resp, err := s.GetExec(req)
+	resp, err = s.GetExec(req)
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare exec endpoint")
 	}
@@ -29,7 +37,7 @@ func (s *Server) Exec(ctx context.Context, req *pb.ExecRequest) (*pb.ExecRespons
 }
 
 // Exec endpoint for streaming.Runtime
-func (ss streamService) Exec(containerID string, cmd []string, stdin io.Reader, stdout, stderr io.WriteCloser, tty bool, resize <-chan term.Size) error {
+func (ss streamService) Exec(containerID string, cmd []string, stdin io.Reader, stdout, stderr io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
 	c := ss.runtimeServer.GetContainer(containerID)
 
 	if c == nil {
@@ -45,12 +53,15 @@ func (ss streamService) Exec(containerID string, cmd []string, stdin io.Reader, 
 		return fmt.Errorf("container is not created or running")
 	}
 
-	args := []string{"exec"}
-	if tty {
-		args = append(args, "-t")
+	processFile, err := oci.PrepareProcessExec(c, cmd, tty)
+	if err != nil {
+		return err
 	}
+	defer os.RemoveAll(processFile.Name())
+
+	args := []string{"exec"}
+	args = append(args, "--process", processFile.Name())
 	args = append(args, c.ID())
-	args = append(args, cmd...)
 	execCmd := exec.Command(ss.runtimeServer.Runtime().Path(c), args...)
 	var cmdErr error
 	if tty {
@@ -63,7 +74,7 @@ func (ss streamService) Exec(containerID string, cmd []string, stdin io.Reader, 
 		// make sure to close the stdout stream
 		defer stdout.Close()
 
-		kubecontainer.HandleResizing(resize, func(size term.Size) {
+		kubecontainer.HandleResizing(resize, func(size remotecommand.TerminalSize) {
 			term.SetSize(p.Fd(), size)
 		})
 

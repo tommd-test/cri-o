@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -20,6 +21,7 @@
 #include <termios.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include <glib.h>
 #include <glib-unix.h>
@@ -102,11 +104,13 @@ static char *opt_runtime_path = NULL;
 static char *opt_bundle_path = NULL;
 static char *opt_pid_file = NULL;
 static bool opt_systemd_cgroup = false;
+static bool opt_no_pivot = false;
 static char *opt_exec_process_spec = NULL;
 static bool opt_exec = false;
 static char *opt_log_path = NULL;
 static char *opt_exit_dir = NULL;
 static int opt_timeout = 0;
+static int64_t opt_log_size_max = -1;
 static GOptionEntry opt_entries[] =
 {
   { "terminal", 't', 0, G_OPTION_ARG_NONE, &opt_terminal, "Terminal", NULL },
@@ -114,6 +118,7 @@ static GOptionEntry opt_entries[] =
   { "cid", 'c', 0, G_OPTION_ARG_STRING, &opt_cid, "Container ID", NULL },
   { "cuuid", 'u', 0, G_OPTION_ARG_STRING, &opt_cuuid, "Container UUID", NULL },
   { "runtime", 'r', 0, G_OPTION_ARG_STRING, &opt_runtime_path, "Runtime path", NULL },
+  { "no-pivot", 0, 0, G_OPTION_ARG_NONE, &opt_no_pivot, "do not use pivot_root", NULL },
   { "bundle", 'b', 0, G_OPTION_ARG_STRING, &opt_bundle_path, "Bundle path", NULL },
   { "pidfile", 'p', 0, G_OPTION_ARG_STRING, &opt_pid_file, "PID file", NULL },
   { "systemd-cgroup", 's', 0, G_OPTION_ARG_NONE, &opt_systemd_cgroup, "Enable systemd cgroup manager", NULL },
@@ -122,6 +127,7 @@ static GOptionEntry opt_entries[] =
   { "exit-dir", 0, 0, G_OPTION_ARG_STRING, &opt_exit_dir, "Path to the directory where exit files are written", NULL },
   { "log-path", 'l', 0, G_OPTION_ARG_STRING, &opt_log_path, "Log file path", NULL },
   { "timeout", 'T', 0, G_OPTION_ARG_INT, &opt_timeout, "Timeout in seconds", NULL },
+  { "log-size-max", 0, 0, G_OPTION_ARG_INT64, &opt_log_size_max, "Maximum size of log file", NULL },
   { NULL }
 };
 
@@ -129,6 +135,8 @@ static GOptionEntry opt_entries[] =
 #define TSBUFLEN 44
 
 #define CGROUP_ROOT "/sys/fs/cgroup"
+
+static int log_fd = -1;
 
 static ssize_t write_all(int fd, const void *buf, size_t count)
 {
@@ -281,11 +289,13 @@ const char *stdpipe_name(stdpipe_t pipe)
  * line in buf, and will partially write the final line of the log if buf is
  * not terminated by a newline.
  */
-int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
+static int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 {
 	char tsbuf[TSBUFLEN];
 	static stdpipe_t trailing_line = NO_PIPE;
 	writev_buffer_t bufv = {0};
+	static int64_t bytes_written = 0;
+	int64_t bytes_to_be_written = 0;
 
 	/*
 	 * Use the same timestamp for every line of the log in this buffer.
@@ -299,6 +309,8 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 	while (buflen > 0) {
 		const char *line_end = NULL;
 		ptrdiff_t line_len = 0;
+		bool insert_newline = FALSE;
+		bool insert_timestamp = FALSE;
 
 		/* Find the end of the line, or alternatively the end of the buffer. */
 		line_end = memchr(buf, '\n', buflen);
@@ -306,12 +318,15 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 			line_end = &buf[buflen-1];
 		line_len = line_end - buf + 1;
 
-		/*
-		 * Write the (timestamp, stream) tuple if there isn't any trailing
-		 * output from the previous line (or if there is trailing output but
-		 * the current buffer being printed is from a different pipe).
-		 */
+		bytes_to_be_written = line_len;
 		if (trailing_line != pipe) {
+			/*
+			 * Write the (timestamp, stream) tuple if there isn't any trailing
+			 * output from the previous line (or if there is trailing output but
+			 * the current buffer being printed is from a different pipe).
+			 */
+			insert_timestamp = TRUE;
+			bytes_to_be_written += (TSBUFLEN - 1);
 			/*
 			 * If there was a trailing line from a different pipe, prepend a
 			 * newline to split it properly. This technically breaks the flow
@@ -319,9 +334,49 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 			 * wasn't one output) but without modifying the file in a
 			 * non-append-only way there's not much we can do.
 			 */
-			if ((trailing_line != NO_PIPE &&
-			     writev_buffer_append_segment(fd, &bufv, "\n", -1) < 0) ||
-			    writev_buffer_append_segment(fd, &bufv, tsbuf, -1) < 0) {
+			if (trailing_line != NO_PIPE) {
+				insert_newline = TRUE;
+				bytes_to_be_written += 1;
+			}
+		}
+
+		/*
+		 * We re-open the log file if writing out the bytes will exceed the max
+		 * log size. We also reset the state so that the new file is started with
+		 * a timestamp.
+		 */
+		if ((opt_log_size_max > 0) && (bytes_written + bytes_to_be_written) > opt_log_size_max) {
+			ninfo("Creating new log file");
+			insert_newline = FALSE;
+			insert_timestamp = TRUE;
+			bytes_written = 0;
+
+			/* Close the existing fd */
+			close(fd);
+
+			/* Unlink the file */
+			if (unlink(opt_log_path) < 0) {
+				pexit("Failed to unlink log file");
+			}
+
+			/* Open the log path file again */
+			log_fd = open(opt_log_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+			if (log_fd < 0)
+				pexit("Failed to open log file");
+			fd = log_fd;
+		}
+
+		/* Output a newline */
+		if (insert_newline) {
+			if (writev_buffer_append_segment(fd, &bufv, "\n", -1) < 0) {
+				nwarn("failed to write newline to log");
+				goto next;
+			}
+		}
+
+		/* Output a timestamp */
+		if (insert_timestamp) {
+			if (writev_buffer_append_segment(fd, &bufv, tsbuf, -1) < 0) {
 				nwarn("failed to write (timestamp, stream) to log");
 				goto next;
 			}
@@ -332,6 +387,8 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 			nwarn("failed to write buffer to log");
 			goto next;
 		}
+
+		bytes_written += bytes_to_be_written;
 
 		/* If we did not output a full line, then we are a trailing_line. */
 		trailing_line = (*line_end == '\n') ? NO_PIPE : pipe;
@@ -345,6 +402,8 @@ next:
 	if (writev_buffer_flush (fd, &bufv) < 0) {
 		nwarn("failed to flush buffer to log");
 	}
+
+	ninfo("Total bytes written: %"PRId64"", bytes_written);
 
 	return 0;
 }
@@ -481,7 +540,6 @@ static int conn_sock = -1;
 static int conn_sock_readable;
 static int conn_sock_writable;
 
-static int log_fd = -1;
 static int oom_event_fd = -1;
 static int attach_socket_fd = -1;
 static int console_socket_fd = -1;
@@ -1207,6 +1265,12 @@ int main(int argc, char *argv[])
 			 "--bundle", opt_bundle_path,
 			 "--pid-file", opt_pid_file,
 			 NULL);
+	}
+
+	if (!opt_exec && opt_no_pivot) {
+		add_argv(runtime_argv,
+			"--no-pivot",
+			NULL);
 	}
 
 	if (csname != NULL) {

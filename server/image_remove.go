@@ -2,15 +2,22 @@ package server
 
 import (
 	"fmt"
-	"strings"
+	"time"
 
+	"github.com/kubernetes-incubator/cri-o/pkg/storage"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1/runtime"
 )
 
 // RemoveImage removes the image.
-func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (*pb.RemoveImageResponse, error) {
+func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (resp *pb.RemoveImageResponse, err error) {
+	const operation = "remove_image"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
+
 	logrus.Debugf("RemoveImageRequest: %+v", req)
 	image := ""
 	img := req.GetImage()
@@ -22,13 +29,11 @@ func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (*
 	}
 	var (
 		images  []string
-		err     error
 		deleted bool
 	)
 	images, err = s.StorageImageServer().ResolveNames(image)
 	if err != nil {
-		// This means we got an image ID
-		if strings.Contains(err.Error(), "cannot specify 64-byte hexadecimal strings") {
+		if err == storage.ErrCannotParseImageID {
 			images = append(images, image)
 		} else {
 			return nil, err
@@ -46,7 +51,7 @@ func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (*
 	if !deleted && err != nil {
 		return nil, err
 	}
-	resp := &pb.RemoveImageResponse{}
+	resp = &pb.RemoveImageResponse{}
 	logrus.Debugf("RemoveImageResponse: %+v", resp)
 	return resp, nil
 }

@@ -3,10 +3,6 @@
 load helpers
 
 IMAGE="redis:alpine"
-ROOT="$TESTDIR/crio"
-RUNROOT="$TESTDIR/crio-run"
-KPOD_OPTIONS="--root $ROOT --runroot $RUNROOT $STORAGE_OPTS"
-NEW_NAME="rename-test"
 
 function teardown() {
     cleanup_test
@@ -15,6 +11,7 @@ function teardown() {
 @test "kpod rename successful" {
     start_crio
     run ${KPOD_BINARY} ${KPOD_OPTIONS} pull $IMAGE
+    echo "$output"
     [ "$status" -eq 0 ]
     run crioctl pod run --config "$TESTDATA"/sandbox_config.json
     echo "$output"
@@ -22,6 +19,7 @@ function teardown() {
     [ "$status" -eq 0 ]
     run crioctl ctr create --config "$TESTDATA"/container_config.json --pod "$pod_id"
     ctr_id="$output"
+    [ "$status" -eq 0 ]
     run ${KPOD_BINARY} $KPOD_OPTIONS rename "$ctr_id" "$NEW_NAME"
     echo "$output"
     [ "$status" -eq 0 ]
